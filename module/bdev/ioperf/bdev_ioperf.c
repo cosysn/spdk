@@ -457,6 +457,7 @@ bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bde
     struct spdk_thread *current_thread = spdk_get_thread();
     struct spdk_thread *target_thread;
     uint32_t i;
+    bool same_thread;
 
     /* Get ioperf bdev from bdev context */
     ioperf = (struct ioperf_bdev *)bdev_io->bdev->ctxt;
@@ -487,6 +488,19 @@ bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bde
         return;
     }
 
+    /* Calculate target thread using LBA hash */
+    uint32_t target_thread_idx = ioperf_hash_lba(lba, ioperf->num_threads);
+
+    /* Get target thread */
+    if (ioperf->thread_pool && ioperf->thread_pool_size > 0) {
+        target_thread = ioperf->thread_pool[target_thread_idx % ioperf->thread_pool_size];
+    } else {
+        target_thread = current_thread;
+    }
+
+    /* Check if target thread is same as current thread */
+    same_thread = (target_thread == current_thread);
+
     /* Allocate IO context from memory pool */
     io_ctx = spdk_mempool_get(ioperf->io_pool);
     if (!io_ctx) {
@@ -495,20 +509,31 @@ bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bde
         return;
     }
 
-    /* Calculate target thread using LBA hash */
-    uint32_t target_thread_idx = ioperf_hash_lba(lba, ioperf->num_threads);
-
-    /* Route I/O to target thread in the pool */
-    if (ioperf->thread_pool && ioperf->thread_pool_size > 0) {
-        target_thread = ioperf->thread_pool[target_thread_idx % ioperf->thread_pool_size];
-    } else {
-        target_thread = current_thread;
-    }
-
     /* Initialize IO context */
     io_ctx->bio = bdev_io;
     io_ctx->target_thread = target_thread_idx;
     io_ctx->src_thread = spdk_bdev_io_get_thread(bdev_io);
+
+    /* Fill hash map values */
+    io_ctx->hash_map_value_1 = (int)(lba % ioperf->hash_map_1.size);
+    io_ctx->hash_map_value_2 = (int)((lba / 1000) % ioperf->hash_map_2.size);
+
+    /* If target thread is same as current, process directly */
+    if (same_thread) {
+        /* Fill all 100+ fields directly */
+        fill_all_fields(io_ctx);
+
+        /* Complete the I/O */
+        spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+
+        /* Update stats */
+        ioperf->total_io++;
+        ioperf->total_bytes += bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen;
+
+        /* Free IO context back to pool */
+        spdk_mempool_put(ioperf->io_pool, io_ctx);
+        return;
+    }
 
     /* Send I/O to target thread for processing */
     spdk_thread_send_msg(target_thread, ioperf_process_io_on_target, io_ctx);
