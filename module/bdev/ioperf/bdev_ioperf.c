@@ -388,13 +388,16 @@ ioperf_worker_thread_stub(void *arg)
     return 0;
 }
 
-/* Create worker threads - simplified: just create memory pool, use current thread for I/O */
+/* Create worker threads - each thread will be polled by reactor */
 static int
 ioperf_create_worker_threads(struct ioperf_bdev *ioperf)
 {
+    uint32_t i;
+    char name[32];
+
     /* Create memory pool for routing context */
     ioperf->routing_pool = spdk_mempool_create("ioperf_routing_pool",
-                                                4096,
+                                                8192,
                                                 sizeof(struct ioperf_routing_ctx),
                                                 0, -1);
     if (!ioperf->routing_pool) {
@@ -402,26 +405,58 @@ ioperf_create_worker_threads(struct ioperf_bdev *ioperf)
         return -ENOMEM;
     }
 
-    /* For now, we don't create separate threads - use current thread for I/O processing
-     * The num_threads parameter is used for LBA hash calculation only
-     * True multi-threading would require coordinating with the application's reactor threads */
+    /* Allocate thread array */
+    ioperf->threads = calloc(ioperf->num_threads, sizeof(struct spdk_thread *));
+    if (!ioperf->threads) {
+        SPDK_ERRLOG("Failed to allocate threads array\n");
+        spdk_mempool_free(ioperf->routing_pool);
+        ioperf->routing_pool = NULL;
+        return -ENOMEM;
+    }
 
-    ioperf->threads = NULL;
-    ioperf->num_active_threads = 0;
+    /* Create worker threads - reactor will poll them automatically */
+    for (i = 0; i < ioperf->num_threads; i++) {
+        snprintf(name, sizeof(name), "ioperf_%s_%u", ioperf->bdev.name, i);
+        ioperf->threads[i] = spdk_thread_create(name, NULL);
+        if (!ioperf->threads[i]) {
+            SPDK_ERRLOG("Failed to create worker thread %u\n", i);
+            goto cleanup;
+        }
+    }
 
+    ioperf->num_active_threads = ioperf->num_threads;
     return 0;
+
+cleanup:
+    for (uint32_t j = 0; j < i; j++) {
+        spdk_thread_destroy(ioperf->threads[j]);
+    }
+    free(ioperf->threads);
+    ioperf->threads = NULL;
+    spdk_mempool_free(ioperf->routing_pool);
+    ioperf->routing_pool = NULL;
+    return -ENOMEM;
 }
 
-/* Stop worker threads - simplified, just free resources without destroying threads */
+/* Stop worker threads */
 static void
 ioperf_destroy_worker_threads(struct ioperf_bdev *ioperf)
 {
+    uint32_t i;
+
     if (!ioperf->threads) {
         return;
     }
 
-    /* Mark threads as stopped - they will be cleaned up by the system */
-    /* Don't call spdk_thread_exit here as it may cause issues with pending messages */
+    /* Exit all threads */
+    for (i = 0; i < ioperf->num_active_threads; i++) {
+        if (ioperf->threads[i]) {
+            spdk_thread_exit(ioperf->threads[i]);
+        }
+    }
+
+    /* Give threads a chance to process exit message */
+    spdk_thread_poll(ioperf->threads[0], 0, 0);
 
     /* Free memory pool */
     if (ioperf->routing_pool) {
@@ -498,11 +533,15 @@ bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bde
         return;
     }
 
-    /* Calculate target thread using LBA hash (for simulation) */
+    /* Calculate target thread using LBA hash */
     uint32_t target_thread_idx = ioperf_hash_lba(lba, ioperf->num_threads);
 
-    /* Use current thread for processing (simulates single-threaded bdev) */
-    target_thread = spdk_get_thread();
+    /* Route I/O to target worker thread - if threads not ready, use current thread */
+    if (ioperf->threads && ioperf->num_active_threads > 0) {
+        target_thread = ioperf->threads[target_thread_idx % ioperf->num_active_threads];
+    } else {
+        target_thread = spdk_get_thread();
+    }
 
     /* Get routing context from memory pool */
     routing = spdk_mempool_get(ioperf->routing_pool);
