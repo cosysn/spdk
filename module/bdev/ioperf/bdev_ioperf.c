@@ -29,6 +29,11 @@ static int bdev_ioperf_initialize(void);
 static void bdev_ioperf_finish(void);
 static int bdev_ioperf_config_json(struct spdk_json_write_ctx *w);
 
+/* Forward declarations */
+static void fill_all_fields(struct ioperf_io_ctx *ctx);
+static void ioperf_process_io_on_target(void *ctx);
+static void ioperf_complete_io(void *ctx);
+
 static int
 bdev_ioperf_get_ctx_size(void)
 {
@@ -137,6 +142,70 @@ ioperf_hash_lba(uint64_t lba, uint32_t num_threads)
      * prime = 2654435761 (Knuth's golden ratio)
      */
     return (uint32_t)((lba * 2654435761ULL) % num_threads);
+}
+
+/* Forward declaration */
+static void ioperf_complete_io(void *ctx);
+
+/* I/O routing context - passed when sending to target thread */
+struct ioperf_routing_ctx {
+    struct spdk_bdev_io *bdev_io;
+    struct ioperf_bdev *ioperf;
+    uint32_t target_thread;
+    struct spdk_thread *src_thread;
+};
+
+/* Complete I/O on source thread */
+static void
+ioperf_complete_io(void *ctx)
+{
+    struct ioperf_routing_ctx *routing = (struct ioperf_routing_ctx *)ctx;
+    struct spdk_bdev_io *bdev_io = routing->bdev_io;
+    struct ioperf_bdev *ioperf = routing->ioperf;
+
+    /* Complete the I/O */
+    spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+
+    /* Update stats */
+    ioperf->total_io++;
+    ioperf->total_bytes += bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen;
+
+    free(routing);
+}
+
+/* Process I/O on target thread */
+static void
+ioperf_process_io_on_target(void *ctx)
+{
+    struct ioperf_routing_ctx *routing = (struct ioperf_routing_ctx *)ctx;
+    struct spdk_bdev_io *bdev_io = routing->bdev_io;
+    struct ioperf_io_ctx *io_ctx = (struct ioperf_io_ctx *)bdev_io->driver_ctx;
+    struct ioperf_bdev *ioperf = routing->ioperf;
+
+    /* Get target thread's channel */
+    struct spdk_io_channel *target_ch = spdk_get_io_channel(&g_ioperf_bdev_head);
+    if (!target_ch) {
+        /* Channel creation failed, complete with error */
+        spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+        free(routing);
+        return;
+    }
+
+    struct ioperf_io_channel *ch = spdk_io_channel_get_ctx(target_ch);
+
+    /* Fill all fields */
+    io_ctx->bio = bdev_io;
+    io_ctx->target_thread = routing->target_thread;
+    io_ctx->hash_map_value_1 = (int)(bdev_io->u.bdev.offset_blocks % ioperf->hash_map_1.size);
+    io_ctx->hash_map_value_2 = (int)((bdev_io->u.bdev.offset_blocks / 1000) % ioperf->hash_map_2.size);
+
+    fill_all_fields(io_ctx);
+
+    /* Release the channel */
+    spdk_put_io_channel(target_ch);
+
+    /* Send completion back to source thread */
+    spdk_thread_send_msg(routing->src_thread, ioperf_complete_io, routing);
 }
 
 static void
@@ -352,9 +421,10 @@ static void
 bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bdev_io)
 {
     struct ioperf_io_ctx *ctx = (struct ioperf_io_ctx *)bdev_io->driver_ctx;
-    struct ioperf_io_channel *ch = spdk_io_channel_get_ctx(_ch);
     struct ioperf_bdev *ioperf;
     uint64_t lba = bdev_io->u.bdev.offset_blocks;
+    struct ioperf_routing_ctx *routing;
+    struct spdk_thread *target_thread;
 
     /* Get ioperf bdev from bdev context, not from global */
     ioperf = (struct ioperf_bdev *)bdev_io->bdev->ctxt;
@@ -363,37 +433,37 @@ bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bde
         return;
     }
 
-    ctx->bio = bdev_io;
-
-    /* 1. LBA hash routing to target thread */
-    ctx->target_thread = ioperf_hash_lba(lba, ioperf->num_threads);
-
-    /* 2. Hash map get operations (with pthread read lock) */
-    int hash_key_1 = (int)(lba % ioperf->hash_map_1.size);
-    int hash_key_2 = (int)((lba / 1000) % ioperf->hash_map_2.size);
-
-    ioperf_hash_map_get(&ioperf->hash_map_1, hash_key_1, &ctx->hash_map_value_1);
-    ioperf_hash_map_get(&ioperf->hash_map_2, hash_key_2, &ctx->hash_map_value_2);
-
-    /* 3. Process IO in the current channel (not routed to other threads) */
-    struct ioperf_io_channel *target_ch = ch;
-
-    /* 4. Check rate limit */
-    if (!rate_limit_check(target_ch, ioperf, bdev_io)) {
+    /* Check rate limit first on source thread */
+    struct ioperf_io_channel *src_ch = spdk_io_channel_get_ctx(_ch);
+    if (!rate_limit_check(src_ch, ioperf, bdev_io)) {
         /* Rate limited - complete with success anyway (simulate full speed) */
         spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
         return;
     }
 
-    /* 5. Fill all 100+ fields */
-    fill_all_fields(ctx);
+    /* Calculate target thread using LBA hash */
+    uint32_t target_thread_idx = ioperf_hash_lba(lba, ioperf->num_threads);
 
-    /* 6. Complete IO immediately (no persistence, no actual delay in submit path) */
-    spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+    /* Get the target thread - for simplicity, we use the same thread for all I/O
+     * In a real implementation, there would be multiple threads created and we would
+     * select based on target_thread_idx
+     * Here we just send to the current thread to test the routing mechanism */
+    target_thread = spdk_get_thread();
 
-    /* 7. Update stats */
-    ioperf->total_io++;
-    ioperf->total_bytes += bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen;
+    /* Allocate routing context */
+    routing = malloc(sizeof(*routing));
+    if (!routing) {
+        spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+        return;
+    }
+
+    routing->bdev_io = bdev_io;
+    routing->ioperf = ioperf;
+    routing->target_thread = target_thread_idx;
+    routing->src_thread = spdk_bdev_io_get_thread(bdev_io);
+
+    /* Send I/O to target thread for processing */
+    spdk_thread_send_msg(target_thread, ioperf_process_io_on_target, routing);
 }
 
 static bool
