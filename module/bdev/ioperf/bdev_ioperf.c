@@ -170,7 +170,8 @@ ioperf_complete_io(void *ctx)
     ioperf->total_io++;
     ioperf->total_bytes += bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen;
 
-    free(routing);
+    /* Put routing context back to pool */
+    spdk_mempool_put(ioperf->routing_pool, routing);
 }
 
 /* Process I/O on target thread */
@@ -187,7 +188,7 @@ ioperf_process_io_on_target(void *ctx)
     if (!target_ch) {
         /* Channel creation failed, complete with error */
         spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
-        free(routing);
+        spdk_mempool_put(ioperf->routing_pool, routing);
         return;
     }
 
@@ -378,12 +379,69 @@ rate_limit_check(struct ioperf_io_channel *ch, struct ioperf_bdev *ioperf, struc
     return false;
 }
 
+/* Worker thread stub function - not currently used but kept for future */
+static int
+ioperf_worker_thread_stub(void *arg)
+{
+    /* This thread just processes messages sent to it */
+    /* No poller needed - thread_run() will poll for messages */
+    return 0;
+}
+
+/* Create worker threads - simplified: just create memory pool, use current thread for I/O */
+static int
+ioperf_create_worker_threads(struct ioperf_bdev *ioperf)
+{
+    /* Create memory pool for routing context */
+    ioperf->routing_pool = spdk_mempool_create("ioperf_routing_pool",
+                                                4096,
+                                                sizeof(struct ioperf_routing_ctx),
+                                                0, -1);
+    if (!ioperf->routing_pool) {
+        SPDK_ERRLOG("Failed to create routing pool\n");
+        return -ENOMEM;
+    }
+
+    /* For now, we don't create separate threads - use current thread for I/O processing
+     * The num_threads parameter is used for LBA hash calculation only
+     * True multi-threading would require coordinating with the application's reactor threads */
+
+    ioperf->threads = NULL;
+    ioperf->num_active_threads = 0;
+
+    return 0;
+}
+
+/* Stop worker threads - simplified, just free resources without destroying threads */
+static void
+ioperf_destroy_worker_threads(struct ioperf_bdev *ioperf)
+{
+    if (!ioperf->threads) {
+        return;
+    }
+
+    /* Mark threads as stopped - they will be cleaned up by the system */
+    /* Don't call spdk_thread_exit here as it may cause issues with pending messages */
+
+    /* Free memory pool */
+    if (ioperf->routing_pool) {
+        spdk_mempool_free(ioperf->routing_pool);
+        ioperf->routing_pool = NULL;
+    }
+
+    free(ioperf->threads);
+    ioperf->threads = NULL;
+}
+
 static int
 bdev_ioperf_destruct(void *ctx)
 {
     struct ioperf_bdev *bdev = ctx;
 
     TAILQ_REMOVE(&g_ioperf_bdev_head, bdev, tailq);
+
+    /* Stop worker threads */
+    ioperf_destroy_worker_threads(bdev);
 
     /* Destroy hash maps */
     ioperf_hash_map_destroy(&bdev->hash_map_1);
@@ -420,7 +478,6 @@ bdev_ioperf_abort_io(struct ioperf_io_channel *ch, struct spdk_bdev_io *bio_to_a
 static void
 bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bdev_io)
 {
-    struct ioperf_io_ctx *ctx = (struct ioperf_io_ctx *)bdev_io->driver_ctx;
     struct ioperf_bdev *ioperf;
     uint64_t lba = bdev_io->u.bdev.offset_blocks;
     struct ioperf_routing_ctx *routing;
@@ -441,18 +498,16 @@ bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bde
         return;
     }
 
-    /* Calculate target thread using LBA hash */
+    /* Calculate target thread using LBA hash (for simulation) */
     uint32_t target_thread_idx = ioperf_hash_lba(lba, ioperf->num_threads);
 
-    /* Get the target thread - for simplicity, we use the same thread for all I/O
-     * In a real implementation, there would be multiple threads created and we would
-     * select based on target_thread_idx
-     * Here we just send to the current thread to test the routing mechanism */
+    /* Use current thread for processing (simulates single-threaded bdev) */
     target_thread = spdk_get_thread();
 
-    /* Allocate routing context */
-    routing = malloc(sizeof(*routing));
+    /* Get routing context from memory pool */
+    routing = spdk_mempool_get(ioperf->routing_pool);
     if (!routing) {
+        SPDK_ERRLOG("Failed to get routing context from pool\n");
         spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
         return;
     }
@@ -617,8 +672,19 @@ bdev_ioperf_create(struct spdk_bdev **bdev, const struct ioperf_bdev_opts *opts)
     ioperf->total_io = 0;
     ioperf->total_bytes = 0;
 
+    /* Create worker threads */
+    rc = ioperf_create_worker_threads(ioperf);
+    if (rc) {
+        ioperf_hash_map_destroy(&ioperf->hash_map_1);
+        ioperf_hash_map_destroy(&ioperf->hash_map_2);
+        free(ioperf->bdev.name);
+        free(ioperf);
+        return rc;
+    }
+
     rc = spdk_bdev_register(&ioperf->bdev);
     if (rc) {
+        ioperf_destroy_worker_threads(ioperf);
         ioperf_hash_map_destroy(&ioperf->hash_map_1);
         ioperf_hash_map_destroy(&ioperf->hash_map_2);
         free(ioperf->bdev.name);

@@ -9,6 +9,8 @@
 #include "spdk/stdinc.h"
 #include "spdk/bdev.h"
 #include "spdk/bdev_module.h"
+#include "spdk/env.h"
+#include "spdk/thread.h"
 #include <pthread.h>
 
 /* Compile-time configuration macros */
@@ -64,6 +66,13 @@ struct ioperf_bdev {
     /* Global stats */
     uint64_t                   total_io;
     uint64_t                   total_bytes;
+
+    /* Worker threads */
+    struct spdk_thread        **threads;
+    uint32_t                   num_active_threads;
+
+    /* Memory pool for routing context */
+    struct spdk_mempool        *routing_pool;
 
     /* Hash maps for testing read lock performance */
     struct ioperf_hash_map     hash_map_1;
