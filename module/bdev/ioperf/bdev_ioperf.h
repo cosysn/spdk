@@ -67,9 +67,9 @@ struct ioperf_bdev {
     uint64_t                   total_io;
     uint64_t                   total_bytes;
 
-    /* Worker threads */
-    struct spdk_thread        **threads;
-    uint32_t                   num_active_threads;
+    /* Worker threads pool - reused from reactor threads */
+    struct spdk_thread        **thread_pool;
+    uint32_t                   thread_pool_size;
 
     /* Memory pool for routing context */
     struct spdk_mempool        *routing_pool;

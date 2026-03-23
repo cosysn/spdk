@@ -388,16 +388,13 @@ ioperf_worker_thread_stub(void *arg)
     return 0;
 }
 
-/* Create worker threads - each thread will be polled by reactor */
+/* Initialize thread pool - will collect threads as they call submit_request */
 static int
-ioperf_create_worker_threads(struct ioperf_bdev *ioperf)
+ioperf_init_thread_pool(struct ioperf_bdev *ioperf)
 {
-    uint32_t i;
-    char name[32];
-
     /* Create memory pool for routing context */
     ioperf->routing_pool = spdk_mempool_create("ioperf_routing_pool",
-                                                8192,
+                                                1024,
                                                 sizeof(struct ioperf_routing_ctx),
                                                 0, -1);
     if (!ioperf->routing_pool) {
@@ -405,67 +402,32 @@ ioperf_create_worker_threads(struct ioperf_bdev *ioperf)
         return -ENOMEM;
     }
 
-    /* Allocate thread array */
-    ioperf->threads = calloc(ioperf->num_threads, sizeof(struct spdk_thread *));
-    if (!ioperf->threads) {
-        SPDK_ERRLOG("Failed to allocate threads array\n");
+    /* Allocate thread pool array - will be populated as threads call submit_request */
+    ioperf->thread_pool = calloc(ioperf->num_threads, sizeof(struct spdk_thread *));
+    if (!ioperf->thread_pool) {
+        SPDK_ERRLOG("Failed to allocate thread pool\n");
         spdk_mempool_free(ioperf->routing_pool);
         ioperf->routing_pool = NULL;
         return -ENOMEM;
     }
 
-    /* Create worker threads - reactor will poll them automatically */
-    for (i = 0; i < ioperf->num_threads; i++) {
-        snprintf(name, sizeof(name), "ioperf_%s_%u", ioperf->bdev.name, i);
-        ioperf->threads[i] = spdk_thread_create(name, NULL);
-        if (!ioperf->threads[i]) {
-            SPDK_ERRLOG("Failed to create worker thread %u\n", i);
-            goto cleanup;
-        }
-    }
-
-    ioperf->num_active_threads = ioperf->num_threads;
+    ioperf->thread_pool_size = 0;
     return 0;
-
-cleanup:
-    for (uint32_t j = 0; j < i; j++) {
-        spdk_thread_destroy(ioperf->threads[j]);
-    }
-    free(ioperf->threads);
-    ioperf->threads = NULL;
-    spdk_mempool_free(ioperf->routing_pool);
-    ioperf->routing_pool = NULL;
-    return -ENOMEM;
 }
 
-/* Stop worker threads */
+/* Cleanup thread pool */
 static void
-ioperf_destroy_worker_threads(struct ioperf_bdev *ioperf)
+ioperf_destroy_thread_pool(struct ioperf_bdev *ioperf)
 {
-    uint32_t i;
-
-    if (!ioperf->threads) {
-        return;
+    if (ioperf->thread_pool) {
+        free(ioperf->thread_pool);
+        ioperf->thread_pool = NULL;
     }
 
-    /* Exit all threads */
-    for (i = 0; i < ioperf->num_active_threads; i++) {
-        if (ioperf->threads[i]) {
-            spdk_thread_exit(ioperf->threads[i]);
-        }
-    }
-
-    /* Give threads a chance to process exit message */
-    spdk_thread_poll(ioperf->threads[0], 0, 0);
-
-    /* Free memory pool */
     if (ioperf->routing_pool) {
         spdk_mempool_free(ioperf->routing_pool);
         ioperf->routing_pool = NULL;
     }
-
-    free(ioperf->threads);
-    ioperf->threads = NULL;
 }
 
 static int
@@ -475,8 +437,8 @@ bdev_ioperf_destruct(void *ctx)
 
     TAILQ_REMOVE(&g_ioperf_bdev_head, bdev, tailq);
 
-    /* Stop worker threads */
-    ioperf_destroy_worker_threads(bdev);
+    /* Cleanup thread pool */
+    ioperf_destroy_thread_pool(bdev);
 
     /* Destroy hash maps */
     ioperf_hash_map_destroy(&bdev->hash_map_1);
@@ -516,13 +478,29 @@ bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bde
     struct ioperf_bdev *ioperf;
     uint64_t lba = bdev_io->u.bdev.offset_blocks;
     struct ioperf_routing_ctx *routing;
+    struct spdk_thread *current_thread = spdk_get_thread();
     struct spdk_thread *target_thread;
+    uint32_t i;
 
     /* Get ioperf bdev from bdev context, not from global */
     ioperf = (struct ioperf_bdev *)bdev_io->bdev->ctxt;
     if (ioperf == NULL) {
         spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
         return;
+    }
+
+    /* Collect current thread into thread pool if not already present */
+    if (ioperf->thread_pool) {
+        bool found = false;
+        for (i = 0; i < ioperf->thread_pool_size; i++) {
+            if (ioperf->thread_pool[i] == current_thread) {
+                found = true;
+                break;
+            }
+        }
+        if (!found && ioperf->thread_pool_size < ioperf->num_threads) {
+            ioperf->thread_pool[ioperf->thread_pool_size++] = current_thread;
+        }
     }
 
     /* Check rate limit first on source thread */
@@ -536,11 +514,11 @@ bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bde
     /* Calculate target thread using LBA hash */
     uint32_t target_thread_idx = ioperf_hash_lba(lba, ioperf->num_threads);
 
-    /* Route I/O to target worker thread - if threads not ready, use current thread */
-    if (ioperf->threads && ioperf->num_active_threads > 0) {
-        target_thread = ioperf->threads[target_thread_idx % ioperf->num_active_threads];
+    /* Route I/O to target thread in the pool */
+    if (ioperf->thread_pool && ioperf->thread_pool_size > 0) {
+        target_thread = ioperf->thread_pool[target_thread_idx % ioperf->thread_pool_size];
     } else {
-        target_thread = spdk_get_thread();
+        target_thread = current_thread;
     }
 
     /* Get routing context from memory pool */
@@ -712,7 +690,7 @@ bdev_ioperf_create(struct spdk_bdev **bdev, const struct ioperf_bdev_opts *opts)
     ioperf->total_bytes = 0;
 
     /* Create worker threads */
-    rc = ioperf_create_worker_threads(ioperf);
+    rc = ioperf_init_thread_pool(ioperf);
     if (rc) {
         ioperf_hash_map_destroy(&ioperf->hash_map_1);
         ioperf_hash_map_destroy(&ioperf->hash_map_2);
@@ -723,7 +701,7 @@ bdev_ioperf_create(struct spdk_bdev **bdev, const struct ioperf_bdev_opts *opts)
 
     rc = spdk_bdev_register(&ioperf->bdev);
     if (rc) {
-        ioperf_destroy_worker_threads(ioperf);
+        ioperf_destroy_thread_pool(ioperf);
         ioperf_hash_map_destroy(&ioperf->hash_map_1);
         ioperf_hash_map_destroy(&ioperf->hash_map_2);
         free(ioperf->bdev.name);
