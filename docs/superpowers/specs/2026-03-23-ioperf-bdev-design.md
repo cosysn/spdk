@@ -17,6 +17,7 @@
 - 支持 100+ 字段的 IO 上下文赋值（模拟内存访问）
 - 支持全局 IOPS 和带宽限制
 - 支持每线程等待队列
+- 支持两个 hash map（用于测试 hash map 对性能的影响）
 
 ## 2. 架构设计
 
@@ -34,6 +35,7 @@ fio → spdk_nvme → nvme_bdev → ioperf_bdev → memory (no persistence)
 | `ioperf_io_channel` | 每个线程一个 channel，包含等待队列 |
 | `ioperf_io_ctx` | 自定义 IO 上下文（100+ 字段） |
 | `ioperf_stats` | 全局统计（原子变量） |
+| `ioperf_hash_map` | 两个 hash map（用于测试读锁对性能的影响） |
 
 ## 3. 数据结构
 
@@ -55,6 +57,14 @@ struct ioperf_bdev {
     /* 全局统计（原子变量） */
     SPDK_ATOMIC(uint64_t)      total_io;
     SPDK_ATOMIC(uint64_t)      total_bytes;
+
+    /* Hash Map（用于测试读锁对性能的影响） */
+    struct {
+        struct pthread_rwlock_t lock;  /* 读写锁 */
+        int                    *keys;  /* key 数组 */
+        int                    *values;/* value 数组 */
+        size_t                  size;   /* map 大小 */
+    } hash_map_1, hash_map_2;
 };
 ```
 
@@ -87,6 +97,10 @@ struct ioperf_io_ctx {
 
     /* 路由信息 */
     uint32_t                   target_thread;
+
+    /* Hash Map 值（用于存储从 hash map 获取的值） */
+    int                        hash_map_value_1;
+    int                        hash_map_value_2;
 };
 ```
 
@@ -105,7 +119,23 @@ ioperf_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
     uint64_t lba = bdev_io->u.bdev.offset_blocks;
     uint32_t target_thread = (lba * 2654435761ULL) % ioperf->num_threads;
 
-    /* 2. 获取目标线程的 channel */
+    /* 2. Hash Map Get 操作（带 pthread 读锁） */
+    int hash_key_1 = (int)(lba % ioperf->hash_map_1.size);
+    int hash_key_2 = (int)((lba / 1000) % ioperf->hash_map_2.size);
+
+    pthread_rwlock_rdlock(&ioperf->hash_map_1.lock);
+    int value_1 = ioperf->hash_map_1.values[hash_key_1];
+    pthread_rwlock_unlock(&ioperf->hash_map_1.lock);
+
+    pthread_rwlock_rdlock(&ioperf->hash_map_2.lock);
+    int value_2 = ioperf->hash_map_2.values[hash_key_2];
+    pthread_rwlock_unlock(&ioperf->hash_map_2.lock);
+
+    /* 将 hash map 的值存储到 IO 上下文中 */
+    ctx->hash_map_value_1 = value_1;
+    ctx->hash_map_value_2 = value_2;
+
+    /* 3. 获取目标线程的 channel */
     struct ioperf_io_channel *target_ch = get_thread_channel(target_thread);
 
     /* 3. 检查速率限制 */
@@ -298,6 +328,7 @@ SPDK_BDEV_MODULE_REGISTER(ioperf, &ioperf_if)
 - `spdk/json.h`
 - `spdk/timer.h`（延迟模拟）
 - `spdk/dif.h`（数据校验）
+- `pthread.h`（读写锁，用于 hash map）
 
 ## 9. 实现步骤
 
@@ -305,6 +336,9 @@ SPDK_BDEV_MODULE_REGISTER(ioperf, &ioperf_if)
 2. 编写 `Makefile`
 3. 编写 `bdev_ioperf.h`（结构体和宏定义）
 4. 编写 `bdev_ioperf.c`（主模块实现）
+   - 初始化两个 hash map（分配内存、初始化读写锁）
+   - 实现 hash map get 操作（IO 提交路径中）
+   - 销毁 hash map（模块结束时）
 5. 编写 `bdev_ioperf_rpc.c`（RPC 接口）
 6. 添加到构建系统
 7. 编译测试

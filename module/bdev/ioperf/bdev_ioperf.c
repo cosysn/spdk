@@ -275,25 +275,30 @@ fill_all_fields(struct ioperf_io_ctx *ctx)
 }
 
 static bool
-rate_limit_check(struct ioperf_io_channel *ch, struct spdk_bdev_io *bdev_io)
+rate_limit_check(struct ioperf_io_channel *ch, struct ioperf_bdev *ioperf, struct spdk_bdev_io *bdev_io)
 {
-    struct ioperf_bdev *ioperf = g_ioperf_bdev;
-
     if (ioperf == NULL) {
         return true;
+    }
+
+    /* Initialize last_time on first call */
+    if (ch->last_time == 0) {
+        ch->last_time = spdk_get_ticks();
+        /* Give initial tokens to allow IO to proceed */
+        ch->token_bucket = ioperf->max_bandwidth_mb * 1024 * 1024;
     }
 
     uint64_t now = spdk_get_ticks();
     uint64_t elapsed = now - ch->last_time;
 
-    if (elapsed == 0) {
-        return ch->token_bucket >= bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen;
+    if (elapsed > 0) {
+        /* Refill token bucket: tokens = MB/s * 1024*1024 / ticks_per_sec * elapsed */
+        uint64_t tokens_per_second = ioperf->max_bandwidth_mb * 1024 * 1024;
+        uint64_t ticks_per_second = spdk_get_ticks_hz();
+        uint64_t tokens_to_add = (tokens_per_second / ticks_per_second) * elapsed;
+        ch->token_bucket += tokens_to_add;
+        ch->last_time = now;
     }
-
-    /* Refill token bucket */
-    uint64_t tokens_per_tick = ioperf->max_bandwidth_mb * 1024 * 1024 / spdk_get_ticks_hz();
-    ch->token_bucket += elapsed * tokens_per_tick;
-    ch->last_time = now;
 
     uint64_t io_size = bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen;
 
@@ -348,8 +353,15 @@ bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bde
 {
     struct ioperf_io_ctx *ctx = (struct ioperf_io_ctx *)bdev_io->driver_ctx;
     struct ioperf_io_channel *ch = spdk_io_channel_get_ctx(_ch);
-    struct ioperf_bdev *ioperf = g_ioperf_bdev;
+    struct ioperf_bdev *ioperf;
     uint64_t lba = bdev_io->u.bdev.offset_blocks;
+
+    /* Get ioperf bdev from bdev context, not from global */
+    ioperf = (struct ioperf_bdev *)bdev_io->bdev->ctxt;
+    if (ioperf == NULL) {
+        spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+        return;
+    }
 
     ctx->bio = bdev_io;
 
@@ -367,7 +379,7 @@ bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bde
     struct ioperf_io_channel *target_ch = ch;
 
     /* 4. Check rate limit */
-    if (!rate_limit_check(target_ch, bdev_io)) {
+    if (!rate_limit_check(target_ch, ioperf, bdev_io)) {
         /* Rate limited - complete with success anyway (simulate full speed) */
         spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
         return;
