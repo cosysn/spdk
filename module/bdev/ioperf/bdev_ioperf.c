@@ -22,7 +22,6 @@ extern int bdev_ioperf_rpc_init(void);
 
 static TAILQ_HEAD(, ioperf_bdev) g_ioperf_bdev_head = TAILQ_HEAD_INITIALIZER(g_ioperf_bdev_head);
 static struct ioperf_bdev *g_ioperf_bdev = NULL;
-static void *g_ioperf_read_buf;
 
 #define MAX_QUEUED_IO 1024
 
@@ -77,6 +76,34 @@ ioperf_hash_map_init(struct ioperf_hash_map *hash_map, size_t size)
     }
 
     return 0;
+}
+
+static int
+ioperf_bdev_create_cb(void *io_device, void *ctx_buf)
+{
+    struct ioperf_io_channel *ch = ctx_buf;
+
+    TAILQ_INIT(&ch->wait_queue);
+    ch->queued_io = 0;
+    ch->last_time = spdk_get_ticks();
+    ch->token_bucket = 0;
+    ch->thread_id = spdk_thread_get_id(spdk_get_thread());
+
+    return 0;
+}
+
+static void
+ioperf_bdev_destroy_cb(void *io_device, void *ctx_buf)
+{
+    struct ioperf_io_channel *ch = ctx_buf;
+
+    /* Drain wait queue */
+    struct ioperf_io_ctx *ctx;
+    while (!TAILQ_EMPTY(&ch->wait_queue)) {
+        ctx = TAILQ_FIRST(&ch->wait_queue);
+        TAILQ_REMOVE(&ch->wait_queue, ctx, link);
+        spdk_bdev_io_complete(ctx->bio, SPDK_BDEV_IO_STATUS_ABORTED);
+    }
 }
 
 static void
@@ -331,8 +358,8 @@ bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bde
     ioperf_hash_map_get(&ioperf->hash_map_1, hash_key_1, &ctx->hash_map_value_1);
     ioperf_hash_map_get(&ioperf->hash_map_2, hash_key_2, &ctx->hash_map_value_2);
 
-    /* 3. Get target thread's channel */
-    struct ioperf_io_channel *target_ch = &ch[ctx->target_thread];
+    /* 3. Process IO in the current channel (not routed to other threads) */
+    struct ioperf_io_channel *target_ch = ch;
 
     /* 4. Check rate limit */
     if (!rate_limit_check(target_ch, bdev_io)) {
@@ -561,13 +588,9 @@ bdev_ioperf_resize(const char *bdev_name, const uint64_t new_size_in_mb)
 static int
 bdev_ioperf_initialize(void)
 {
-    /* Allocate read buffer */
-    g_ioperf_read_buf = spdk_zmalloc(SPDK_BDEV_LARGE_BUF_MAX_SIZE, 0x1000, NULL,
-                                      SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
-    if (!g_ioperf_read_buf) {
-        SPDK_ERRLOG("Failed to allocate read buffer\n");
-        return -ENOMEM;
-    }
+    /* Register the io_device before getting io_channel */
+    spdk_io_device_register(&g_ioperf_bdev_head, ioperf_bdev_create_cb, ioperf_bdev_destroy_cb,
+                            sizeof(struct ioperf_io_channel), "ioperf_bdev");
 
     /* Initialize RPC handlers */
     bdev_ioperf_rpc_init();
@@ -578,8 +601,5 @@ bdev_ioperf_initialize(void)
 static void
 bdev_ioperf_finish(void)
 {
-    if (g_ioperf_read_buf) {
-        spdk_free(g_ioperf_read_buf);
-        g_ioperf_read_buf = NULL;
-    }
+    /* Nothing to clean up */
 }
