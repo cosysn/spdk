@@ -147,21 +147,13 @@ ioperf_hash_lba(uint64_t lba, uint32_t num_threads)
 /* Forward declaration */
 static void ioperf_complete_io(void *ctx);
 
-/* I/O routing context - passed when sending to target thread */
-struct ioperf_routing_ctx {
-    struct spdk_bdev_io *bdev_io;
-    struct ioperf_bdev *ioperf;
-    uint32_t target_thread;
-    struct spdk_thread *src_thread;
-};
-
-/* Complete I/O on source thread */
+/* Complete I/O on source thread - io_ctx is freed here */
 static void
 ioperf_complete_io(void *ctx)
 {
-    struct ioperf_routing_ctx *routing = (struct ioperf_routing_ctx *)ctx;
-    struct spdk_bdev_io *bdev_io = routing->bdev_io;
-    struct ioperf_bdev *ioperf = routing->ioperf;
+    struct ioperf_io_ctx *io_ctx = (struct ioperf_io_ctx *)ctx;
+    struct spdk_bdev_io *bdev_io = io_ctx->bio;
+    struct ioperf_bdev *ioperf = (struct ioperf_bdev *)bdev_io->bdev->ctxt;
 
     /* Complete the I/O */
     spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
@@ -170,43 +162,27 @@ ioperf_complete_io(void *ctx)
     ioperf->total_io++;
     ioperf->total_bytes += bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen;
 
-    /* Put routing context back to pool */
-    spdk_mempool_put(ioperf->routing_pool, routing);
+    /* Free io_ctx back to pool */
+    spdk_mempool_put(ioperf->io_pool, io_ctx);
 }
 
 /* Process I/O on target thread */
 static void
 ioperf_process_io_on_target(void *ctx)
 {
-    struct ioperf_routing_ctx *routing = (struct ioperf_routing_ctx *)ctx;
-    struct spdk_bdev_io *bdev_io = routing->bdev_io;
-    struct ioperf_io_ctx *io_ctx = (struct ioperf_io_ctx *)bdev_io->driver_ctx;
-    struct ioperf_bdev *ioperf = routing->ioperf;
+    struct ioperf_io_ctx *io_ctx = (struct ioperf_io_ctx *)ctx;
+    struct spdk_bdev_io *bdev_io = io_ctx->bio;
+    struct ioperf_bdev *ioperf = (struct ioperf_bdev *)bdev_io->bdev->ctxt;
 
-    /* Get target thread's channel */
-    struct spdk_io_channel *target_ch = spdk_get_io_channel(&g_ioperf_bdev_head);
-    if (!target_ch) {
-        /* Channel creation failed, complete with error */
-        spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
-        spdk_mempool_put(ioperf->routing_pool, routing);
-        return;
-    }
-
-    struct ioperf_io_channel *ch = spdk_io_channel_get_ctx(target_ch);
-
-    /* Fill all fields */
-    io_ctx->bio = bdev_io;
-    io_ctx->target_thread = routing->target_thread;
+    /* Fill hash map values */
     io_ctx->hash_map_value_1 = (int)(bdev_io->u.bdev.offset_blocks % ioperf->hash_map_1.size);
     io_ctx->hash_map_value_2 = (int)((bdev_io->u.bdev.offset_blocks / 1000) % ioperf->hash_map_2.size);
 
+    /* Fill all 100+ fields */
     fill_all_fields(io_ctx);
 
-    /* Release the channel */
-    spdk_put_io_channel(target_ch);
-
     /* Send completion back to source thread */
-    spdk_thread_send_msg(routing->src_thread, ioperf_complete_io, routing);
+    spdk_thread_send_msg(io_ctx->src_thread, ioperf_complete_io, io_ctx);
 }
 
 static void
@@ -392,13 +368,13 @@ ioperf_worker_thread_stub(void *arg)
 static int
 ioperf_init_thread_pool(struct ioperf_bdev *ioperf)
 {
-    /* Create memory pool for routing context */
-    ioperf->routing_pool = spdk_mempool_create("ioperf_routing_pool",
-                                                1024,
-                                                sizeof(struct ioperf_routing_ctx),
-                                                0, -1);
-    if (!ioperf->routing_pool) {
-        SPDK_ERRLOG("Failed to create routing pool\n");
+    /* Create memory pool for IO requests (includes routing info + 100+ fields) */
+    ioperf->io_pool = spdk_mempool_create("ioperf_io_pool",
+                                            4096,
+                                            sizeof(struct ioperf_io_ctx),
+                                            0, -1);
+    if (!ioperf->io_pool) {
+        SPDK_ERRLOG("Failed to create IO pool\n");
         return -ENOMEM;
     }
 
@@ -406,8 +382,8 @@ ioperf_init_thread_pool(struct ioperf_bdev *ioperf)
     ioperf->thread_pool = calloc(ioperf->num_threads, sizeof(struct spdk_thread *));
     if (!ioperf->thread_pool) {
         SPDK_ERRLOG("Failed to allocate thread pool\n");
-        spdk_mempool_free(ioperf->routing_pool);
-        ioperf->routing_pool = NULL;
+        spdk_mempool_free(ioperf->io_pool);
+        ioperf->io_pool = NULL;
         return -ENOMEM;
     }
 
@@ -424,9 +400,9 @@ ioperf_destroy_thread_pool(struct ioperf_bdev *ioperf)
         ioperf->thread_pool = NULL;
     }
 
-    if (ioperf->routing_pool) {
-        spdk_mempool_free(ioperf->routing_pool);
-        ioperf->routing_pool = NULL;
+    if (ioperf->io_pool) {
+        spdk_mempool_free(ioperf->io_pool);
+        ioperf->io_pool = NULL;
     }
 }
 
@@ -477,12 +453,12 @@ bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bde
 {
     struct ioperf_bdev *ioperf;
     uint64_t lba = bdev_io->u.bdev.offset_blocks;
-    struct ioperf_routing_ctx *routing;
+    struct ioperf_io_ctx *io_ctx;
     struct spdk_thread *current_thread = spdk_get_thread();
     struct spdk_thread *target_thread;
     uint32_t i;
 
-    /* Get ioperf bdev from bdev context, not from global */
+    /* Get ioperf bdev from bdev context */
     ioperf = (struct ioperf_bdev *)bdev_io->bdev->ctxt;
     if (ioperf == NULL) {
         spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
@@ -511,6 +487,14 @@ bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bde
         return;
     }
 
+    /* Allocate IO context from memory pool */
+    io_ctx = spdk_mempool_get(ioperf->io_pool);
+    if (!io_ctx) {
+        SPDK_ERRLOG("Failed to get IO context from pool\n");
+        spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+        return;
+    }
+
     /* Calculate target thread using LBA hash */
     uint32_t target_thread_idx = ioperf_hash_lba(lba, ioperf->num_threads);
 
@@ -521,21 +505,13 @@ bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bde
         target_thread = current_thread;
     }
 
-    /* Get routing context from memory pool */
-    routing = spdk_mempool_get(ioperf->routing_pool);
-    if (!routing) {
-        SPDK_ERRLOG("Failed to get routing context from pool\n");
-        spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
-        return;
-    }
-
-    routing->bdev_io = bdev_io;
-    routing->ioperf = ioperf;
-    routing->target_thread = target_thread_idx;
-    routing->src_thread = spdk_bdev_io_get_thread(bdev_io);
+    /* Initialize IO context */
+    io_ctx->bio = bdev_io;
+    io_ctx->target_thread = target_thread_idx;
+    io_ctx->src_thread = spdk_bdev_io_get_thread(bdev_io);
 
     /* Send I/O to target thread for processing */
-    spdk_thread_send_msg(target_thread, ioperf_process_io_on_target, routing);
+    spdk_thread_send_msg(target_thread, ioperf_process_io_on_target, io_ctx);
 }
 
 static bool

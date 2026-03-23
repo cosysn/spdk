@@ -71,8 +71,8 @@ struct ioperf_bdev {
     struct spdk_thread        **thread_pool;
     uint32_t                   thread_pool_size;
 
-    /* Memory pool for routing context */
-    struct spdk_mempool        *routing_pool;
+    /* Memory pool for IO requests (includes routing info + 100+ fields) */
+    struct spdk_mempool        *io_pool;
 
     /* Hash maps for testing read lock performance */
     struct ioperf_hash_map     hash_map_1;
@@ -88,10 +88,18 @@ struct ioperf_io_channel {
     uint32_t                        thread_id;
 };
 
-/* IO context (driver_ctx) - 100+ fields */
+/* IO request structure - allocated from memory pool */
 struct ioperf_io_ctx {
     TAILQ_ENTRY(ioperf_io_ctx) link;
     struct spdk_bdev_io        *bio;
+
+    /* Routing info */
+    uint32_t                   target_thread;
+    struct spdk_thread         *src_thread;
+
+    /* Hash map values */
+    int                        hash_map_value_1;
+    int                        hash_map_value_2;
 
     /* 100+ fields for memory access simulation */
     uint64_t                   field_001;
@@ -222,13 +230,6 @@ struct ioperf_io_ctx {
     uint64_t                   field_126;
     uint64_t                   field_127;
     uint64_t                   field_128;
-
-    /* Routing info */
-    uint32_t                   target_thread;
-
-    /* Hash map values */
-    int                        hash_map_value_1;
-    int                        hash_map_value_2;
 };
 
 /* Options for creating ioperf bdev */
