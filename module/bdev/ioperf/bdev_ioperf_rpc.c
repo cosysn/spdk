@@ -51,22 +51,6 @@ static const struct spdk_json_object_decoder rpc_bdev_ioperf_create_decoders[] =
 };
 
 static void
-bdev_ioperf_create_json(const struct ioperf_bdev_opts *opts, struct spdk_json_write_ctx *w)
-{
-	spdk_json_write_object_begin(w);
-	spdk_json_write_named_string(w, "name", opts->name);
-	spdk_json_write_named_uuid(w, "uuid", &opts->uuid);
-	spdk_json_write_named_uint64(w, "num_blocks", opts->num_blocks);
-	spdk_json_write_named_uint32(w, "block_size", opts->block_size);
-	spdk_json_write_named_uint32(w, "physical_block_size", opts->physical_block_size);
-	spdk_json_write_named_uint32(w, "num_threads", opts->num_threads);
-	spdk_json_write_named_uint64(w, "read_latency_us", opts->read_latency_us);
-	spdk_json_write_named_uint64(w, "write_latency_us", opts->write_latency_us);
-	spdk_json_write_named_bool(w, "enable_validation", opts->enable_validation);
-	spdk_json_write_object_end(w);
-}
-
-static void
 rpc_bdev_ioperf_create(struct spdk_jsonrpc_request *request,
 		       const struct spdk_json_val *params)
 {
@@ -123,7 +107,7 @@ rpc_bdev_ioperf_create(struct spdk_jsonrpc_request *request,
 	}
 
 	w = spdk_jsonrpc_begin_result(request);
-	bdev_ioperf_create_json(&opts, w);
+	spdk_json_write_string(w, bdev->name);
 	spdk_jsonrpc_end_result(request, w);
 
 cleanup:
