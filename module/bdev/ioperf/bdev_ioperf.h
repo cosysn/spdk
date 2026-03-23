@@ -72,7 +72,6 @@ struct ioperf_bdev {
 
 /* IO channel structure (per thread) */
 struct ioperf_io_channel {
-    struct spdk_poller              *poller;
     TAILQ_HEAD(, ioperf_io_ctx)    wait_queue;
     uint64_t                        queued_io;
     uint64_t                        last_time;
