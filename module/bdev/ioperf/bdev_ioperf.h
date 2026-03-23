@@ -61,9 +61,9 @@ struct ioperf_bdev {
     uint64_t                   max_bandwidth_mb;
     bool                       enable_validation;
 
-    /* Global stats (atomic) */
-    SPDK_ATOMIC(uint64_t)      total_io;
-    SPDK_ATOMIC(uint64_t)      total_bytes;
+    /* Global stats */
+    uint64_t                   total_io;
+    uint64_t                   total_bytes;
 
     /* Hash maps for testing read lock performance */
     struct ioperf_hash_map     hash_map_1;

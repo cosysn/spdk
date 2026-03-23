@@ -1,0 +1,585 @@
+/*   SPDX-License-Identifier: BSD-3-Clause
+ *   Copyright (C) 2024 Intel Corporation.
+ *   All rights reserved.
+ */
+
+#include "spdk/stdinc.h"
+
+#include "spdk/bdev.h"
+#include "spdk/env.h"
+#include "spdk/thread.h"
+#include "spdk/json.h"
+#include "spdk/string.h"
+#include "spdk/likely.h"
+
+#include "spdk/bdev_module.h"
+#include "spdk/log.h"
+
+#include "bdev_ioperf.h"
+
+/* RPC handlers are in bdev_ioperf_rpc.c */
+extern int bdev_ioperf_rpc_init(void);
+
+static TAILQ_HEAD(, ioperf_bdev) g_ioperf_bdev_head = TAILQ_HEAD_INITIALIZER(g_ioperf_bdev_head);
+static struct ioperf_bdev *g_ioperf_bdev = NULL;
+static void *g_ioperf_read_buf;
+
+#define MAX_QUEUED_IO 1024
+
+static int bdev_ioperf_initialize(void);
+static void bdev_ioperf_finish(void);
+static int bdev_ioperf_config_json(struct spdk_json_write_ctx *w);
+
+static int
+bdev_ioperf_get_ctx_size(void)
+{
+    return sizeof(struct ioperf_io_ctx);
+}
+
+static struct spdk_bdev_module ioperf_if = {
+    .name = "ioperf",
+    .module_init = bdev_ioperf_initialize,
+    .module_fini = bdev_ioperf_finish,
+    .config_json = bdev_ioperf_config_json,
+    .async_fini = true,
+    .get_ctx_size = bdev_ioperf_get_ctx_size,
+};
+
+SPDK_BDEV_MODULE_REGISTER(ioperf, &ioperf_if)
+
+static int
+ioperf_hash_map_init(struct ioperf_hash_map *hash_map, size_t size)
+{
+    hash_map->size = size;
+
+    if (pthread_rwlock_init(&hash_map->lock, NULL) != 0) {
+        SPDK_ERRLOG("Failed to initialize hash map lock\n");
+        return -1;
+    }
+
+    hash_map->keys = calloc(size, sizeof(int));
+    if (!hash_map->keys) {
+        pthread_rwlock_destroy(&hash_map->lock);
+        return -1;
+    }
+
+    hash_map->values = calloc(size, sizeof(int));
+    if (!hash_map->values) {
+        free(hash_map->keys);
+        pthread_rwlock_destroy(&hash_map->lock);
+        return -1;
+    }
+
+    /* Initialize with sequential values for testing */
+    for (size_t i = 0; i < size; i++) {
+        hash_map->keys[i] = (int)i;
+        hash_map->values[i] = (int)(i * 2);
+    }
+
+    return 0;
+}
+
+static void
+ioperf_hash_map_destroy(struct ioperf_hash_map *hash_map)
+{
+    if (hash_map->keys) {
+        free(hash_map->keys);
+    }
+    if (hash_map->values) {
+        free(hash_map->values);
+    }
+    pthread_rwlock_destroy(&hash_map->lock);
+}
+
+static int
+ioperf_hash_map_get(struct ioperf_hash_map *hash_map, int key, int *value)
+{
+    int idx = key % (int)hash_map->size;
+
+    pthread_rwlock_rdlock(&hash_map->lock);
+    *value = hash_map->values[idx];
+    pthread_rwlock_unlock(&hash_map->lock);
+
+    return 0;
+}
+
+static uint32_t
+ioperf_hash_lba(uint64_t lba, uint32_t num_threads)
+{
+    /* Simple hash: (lba * prime) % num_threads
+     * prime = 2654435761 (Knuth's golden ratio)
+     */
+    return (uint32_t)((lba * 2654435761ULL) % num_threads);
+}
+
+static void
+fill_all_fields(struct ioperf_io_ctx *ctx)
+{
+    struct spdk_bdev_io *bio = ctx->bio;
+
+    ctx->field_001 = bio->u.bdev.offset_blocks;
+    ctx->field_002 = bio->u.bdev.num_blocks;
+    ctx->field_003 = bio->bdev->blocklen;
+    ctx->field_004 = bio->type;
+    ctx->field_005 = ctx->target_thread;
+    ctx->field_006 = ctx->hash_map_value_1;
+    ctx->field_007 = ctx->hash_map_value_2;
+    ctx->field_008 = spdk_get_ticks();
+    ctx->field_009 = bio->u.bdev.iovcnt;
+    ctx->field_010 = bio->u.bdev.num_blocks * bio->bdev->blocklen;
+    ctx->field_011 = ctx->field_001 + ctx->field_002;
+    ctx->field_012 = ctx->field_003 + ctx->field_004;
+    ctx->field_013 = ctx->field_005 + ctx->field_006;
+    ctx->field_014 = ctx->field_007 + ctx->field_008;
+    ctx->field_015 = ctx->field_009 + ctx->field_010;
+    ctx->field_016 = ctx->field_001 * 2;
+    ctx->field_017 = ctx->field_002 * 2;
+    ctx->field_018 = ctx->field_003 * 2;
+    ctx->field_019 = ctx->field_004 * 2;
+    ctx->field_020 = ctx->field_005 * 2;
+    ctx->field_021 = ctx->field_006 * 2;
+    ctx->field_022 = ctx->field_007 * 2;
+    ctx->field_023 = ctx->field_008 * 2;
+    ctx->field_024 = ctx->field_009 * 2;
+    ctx->field_025 = ctx->field_010 * 2;
+    ctx->field_026 = ctx->field_001 - ctx->field_002;
+    ctx->field_027 = ctx->field_003 - ctx->field_004;
+    ctx->field_028 = ctx->field_005 - ctx->field_006;
+    ctx->field_029 = ctx->field_007 - ctx->field_008;
+    ctx->field_030 = ctx->field_009 - ctx->field_010;
+    ctx->field_031 = ctx->field_001 & 0xFF;
+    ctx->field_032 = ctx->field_002 & 0xFF;
+    ctx->field_033 = ctx->field_003 & 0xFF;
+    ctx->field_034 = ctx->field_004 & 0xFF;
+    ctx->field_035 = ctx->field_005 & 0xFF;
+    ctx->field_036 = ctx->field_006 | 0xFF;
+    ctx->field_037 = ctx->field_007 | 0xFF;
+    ctx->field_038 = ctx->field_008 | 0xFF;
+    ctx->field_039 = ctx->field_009 | 0xFF;
+    ctx->field_040 = ctx->field_010 | 0xFF;
+    ctx->field_041 = ctx->field_001 ^ ctx->field_002;
+    ctx->field_042 = ctx->field_003 ^ ctx->field_004;
+    ctx->field_043 = ctx->field_005 ^ ctx->field_006;
+    ctx->field_044 = ctx->field_007 ^ ctx->field_008;
+    ctx->field_045 = ctx->field_009 ^ ctx->field_010;
+    ctx->field_046 = ctx->field_001 << 1;
+    ctx->field_047 = ctx->field_002 << 1;
+    ctx->field_048 = ctx->field_003 << 1;
+    ctx->field_049 = ctx->field_004 << 1;
+    ctx->field_050 = ctx->field_005 << 1;
+    ctx->field_051 = ctx->field_006 >> 1;
+    ctx->field_052 = ctx->field_007 >> 1;
+    ctx->field_053 = ctx->field_008 >> 1;
+    ctx->field_054 = ctx->field_009 >> 1;
+    ctx->field_055 = ctx->field_010 >> 1;
+    ctx->field_056 = ctx->field_001 + ctx->field_003;
+    ctx->field_057 = ctx->field_002 + ctx->field_004;
+    ctx->field_058 = ctx->field_005 + ctx->field_007;
+    ctx->field_059 = ctx->field_006 + ctx->field_008;
+    ctx->field_060 = ctx->field_009 + ctx->field_010;
+    ctx->field_061 = ctx->field_001 * ctx->field_002;
+    ctx->field_062 = ctx->field_003 * ctx->field_004;
+    ctx->field_063 = ctx->field_005 * ctx->field_006;
+    ctx->field_064 = ctx->field_007 * ctx->field_008;
+    ctx->field_065 = ctx->field_009 * ctx->field_010;
+    ctx->field_066 = ctx->field_001 % 100;
+    ctx->field_067 = ctx->field_002 % 100;
+    ctx->field_068 = ctx->field_003 % 100;
+    ctx->field_069 = ctx->field_004 % 100;
+    ctx->field_070 = ctx->field_005 % 100;
+    ctx->field_071 = ctx->field_001 / 2;
+    ctx->field_072 = ctx->field_002 / 2;
+    ctx->field_073 = ctx->field_003 / 2;
+    ctx->field_074 = ctx->field_004 / 2;
+    ctx->field_075 = ctx->field_005 / 2;
+    ctx->field_076 = ctx->field_001 + 1;
+    ctx->field_077 = ctx->field_002 + 1;
+    ctx->field_078 = ctx->field_003 + 1;
+    ctx->field_079 = ctx->field_004 + 1;
+    ctx->field_080 = ctx->field_005 + 1;
+    ctx->field_081 = ctx->field_001 - 1;
+    ctx->field_082 = ctx->field_002 - 1;
+    ctx->field_083 = ctx->field_003 - 1;
+    ctx->field_084 = ctx->field_004 - 1;
+    ctx->field_085 = ctx->field_005 - 1;
+    ctx->field_086 = ctx->field_006 + ctx->field_007;
+    ctx->field_087 = ctx->field_008 + ctx->field_009;
+    ctx->field_088 = ctx->field_010 + ctx->field_001;
+    ctx->field_089 = ctx->field_002 + ctx->field_003;
+    ctx->field_090 = ctx->field_004 + ctx->field_005;
+    ctx->field_091 = ctx->field_006 * ctx->field_007;
+    ctx->field_092 = ctx->field_008 * ctx->field_009;
+    ctx->field_093 = ctx->field_010 * ctx->field_001;
+    ctx->field_094 = ctx->field_002 * ctx->field_003;
+    ctx->field_095 = ctx->field_004 * ctx->field_005;
+    ctx->field_096 = ctx->field_006 - ctx->field_007;
+    ctx->field_097 = ctx->field_008 - ctx->field_009;
+    ctx->field_098 = ctx->field_010 - ctx->field_001;
+    ctx->field_099 = ctx->field_002 - ctx->field_003;
+    ctx->field_100 = ctx->field_004 - ctx->field_005;
+    ctx->field_101 = ctx->field_006 & ctx->field_007;
+    ctx->field_102 = ctx->field_008 & ctx->field_009;
+    ctx->field_103 = ctx->field_010 & ctx->field_001;
+    ctx->field_104 = ctx->field_002 & ctx->field_003;
+    ctx->field_105 = ctx->field_004 & ctx->field_005;
+    ctx->field_106 = ctx->field_006 | ctx->field_007;
+    ctx->field_107 = ctx->field_008 | ctx->field_009;
+    ctx->field_108 = ctx->field_010 | ctx->field_001;
+    ctx->field_109 = ctx->field_002 | ctx->field_003;
+    ctx->field_110 = ctx->field_004 | ctx->field_005;
+    ctx->field_111 = ctx->field_006 ^ ctx->field_007;
+    ctx->field_112 = ctx->field_008 ^ ctx->field_009;
+    ctx->field_113 = ctx->field_010 ^ ctx->field_001;
+    ctx->field_114 = ctx->field_002 ^ ctx->field_003;
+    ctx->field_115 = ctx->field_004 ^ ctx->field_005;
+    ctx->field_116 = ctx->field_001 << 2;
+    ctx->field_117 = ctx->field_002 << 2;
+    ctx->field_118 = ctx->field_003 << 2;
+    ctx->field_119 = ctx->field_004 << 2;
+    ctx->field_120 = ctx->field_005 << 2;
+    ctx->field_121 = ctx->field_006 >> 2;
+    ctx->field_122 = ctx->field_007 >> 2;
+    ctx->field_123 = ctx->field_008 >> 2;
+    ctx->field_124 = ctx->field_009 >> 2;
+    ctx->field_125 = ctx->field_010 >> 2;
+    ctx->field_126 = ctx->field_001 + ctx->field_002 + ctx->field_003;
+    ctx->field_127 = ctx->field_004 + ctx->field_005 + ctx->field_006;
+    ctx->field_128 = spdk_get_ticks();
+}
+
+static bool
+rate_limit_check(struct ioperf_io_channel *ch, struct spdk_bdev_io *bdev_io)
+{
+    struct ioperf_bdev *ioperf = g_ioperf_bdev;
+    uint64_t now = spdk_get_ticks();
+    uint64_t elapsed = now - ch->last_time;
+
+    if (elapsed == 0) {
+        return ch->token_bucket >= bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen;
+    }
+
+    /* Refill token bucket */
+    uint64_t tokens_per_tick = ioperf->max_bandwidth_mb * 1024 * 1024 / spdk_get_ticks_hz();
+    ch->token_bucket += elapsed * tokens_per_tick;
+    ch->last_time = now;
+
+    uint64_t io_size = bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen;
+
+    if (ch->queued_io < MAX_QUEUED_IO && ch->token_bucket >= io_size) {
+        ch->token_bucket -= io_size;
+        return true;
+    }
+    return false;
+}
+
+static int
+bdev_ioperf_destruct(void *ctx)
+{
+    struct ioperf_bdev *bdev = ctx;
+
+    TAILQ_REMOVE(&g_ioperf_bdev_head, bdev, tailq);
+
+    /* Destroy hash maps */
+    ioperf_hash_map_destroy(&bdev->hash_map_1);
+    ioperf_hash_map_destroy(&bdev->hash_map_2);
+
+    free(bdev->bdev.name);
+    free(bdev);
+
+    g_ioperf_bdev = NULL;
+
+    return 0;
+}
+
+static bool
+bdev_ioperf_abort_io(struct ioperf_io_channel *ch, struct spdk_bdev_io *bio_to_abort)
+{
+    struct ioperf_io_ctx *io_ctx;
+    struct spdk_bdev_io *bdev_io;
+
+    TAILQ_FOREACH(io_ctx, &ch->wait_queue, link) {
+        bdev_io = spdk_bdev_io_from_ctx(io_ctx);
+
+        if (bdev_io == bio_to_abort) {
+            TAILQ_REMOVE(&ch->wait_queue, io_ctx, link);
+            ch->queued_io--;
+            spdk_bdev_io_complete(bio_to_abort, SPDK_BDEV_IO_STATUS_ABORTED);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void
+bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bdev_io)
+{
+    struct ioperf_io_ctx *ctx = (struct ioperf_io_ctx *)bdev_io->driver_ctx;
+    struct ioperf_io_channel *ch = spdk_io_channel_get_ctx(_ch);
+    struct ioperf_bdev *ioperf = g_ioperf_bdev;
+    uint64_t lba = bdev_io->u.bdev.offset_blocks;
+
+    ctx->bio = bdev_io;
+
+    /* 1. LBA hash routing to target thread */
+    ctx->target_thread = ioperf_hash_lba(lba, ioperf->num_threads);
+
+    /* 2. Hash map get operations (with pthread read lock) */
+    int hash_key_1 = (int)(lba % ioperf->hash_map_1.size);
+    int hash_key_2 = (int)((lba / 1000) % ioperf->hash_map_2.size);
+
+    ioperf_hash_map_get(&ioperf->hash_map_1, hash_key_1, &ctx->hash_map_value_1);
+    ioperf_hash_map_get(&ioperf->hash_map_2, hash_key_2, &ctx->hash_map_value_2);
+
+    /* 3. Get target thread's channel */
+    struct ioperf_io_channel *target_ch = &ch[ctx->target_thread];
+
+    /* 4. Check rate limit */
+    if (!rate_limit_check(target_ch, bdev_io)) {
+        TAILQ_INSERT_TAIL(&target_ch->wait_queue, ctx, link);
+        target_ch->queued_io++;
+        return;
+    }
+
+    /* 5. Fill all 100+ fields */
+    fill_all_fields(ctx);
+
+    /* 6. Complete IO immediately (no persistence, no actual delay in submit path) */
+    spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+
+    /* 7. Update stats */
+    ioperf->total_io++;
+    ioperf->total_bytes += bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen;
+}
+
+static bool
+bdev_ioperf_io_type_supported(void *ctx, enum spdk_bdev_io_type io_type)
+{
+    switch (io_type) {
+    case SPDK_BDEV_IO_TYPE_READ:
+    case SPDK_BDEV_IO_TYPE_WRITE:
+    case SPDK_BDEV_IO_TYPE_WRITE_ZEROES:
+    case SPDK_BDEV_IO_TYPE_RESET:
+    case SPDK_BDEV_IO_TYPE_ABORT:
+        return true;
+    case SPDK_BDEV_IO_TYPE_FLUSH:
+    case SPDK_BDEV_IO_TYPE_UNMAP:
+    default:
+        return false;
+    }
+}
+
+static struct spdk_io_channel *
+bdev_ioperf_get_io_channel(void *ctx)
+{
+    return spdk_get_io_channel(&g_ioperf_bdev_head);
+}
+
+static const struct spdk_bdev_fn_table ioperf_fn_table = {
+    .destruct = bdev_ioperf_destruct,
+    .submit_request = bdev_ioperf_submit_request,
+    .io_type_supported = bdev_ioperf_io_type_supported,
+    .get_io_channel = bdev_ioperf_get_io_channel,
+};
+
+static void
+bdev_ioperf_write_config_json(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w)
+{
+    struct ioperf_bdev *ioperf = (struct ioperf_bdev *)bdev;
+
+    spdk_json_write_object_begin(w);
+
+    spdk_json_write_named_string(w, "method", "bdev_ioperf_create");
+
+    spdk_json_write_named_object_begin(w, "params");
+    spdk_json_write_named_string(w, "name", bdev->name);
+    spdk_json_write_named_uint64(w, "num_blocks", bdev->blockcnt);
+    spdk_json_write_named_uint32(w, "block_size", bdev->blocklen);
+    spdk_json_write_named_uint32(w, "physical_block_size", bdev->phys_blocklen);
+    spdk_json_write_named_uint32(w, "num_threads", ioperf->num_threads);
+    spdk_json_write_named_uint64(w, "read_latency_us", ioperf->read_latency_us);
+    spdk_json_write_named_uint64(w, "write_latency_us", ioperf->write_latency_us);
+    spdk_json_write_named_bool(w, "enable_validation", ioperf->enable_validation);
+    spdk_json_write_named_uuid(w, "uuid", &bdev->uuid);
+    spdk_json_write_object_end(w);
+
+    spdk_json_write_object_end(w);
+}
+
+static int
+bdev_ioperf_config_json(struct spdk_json_write_ctx *w)
+{
+    struct ioperf_bdev *bdev;
+
+    spdk_json_write_batch_begin(w);
+    TAILQ_FOREACH(bdev, &g_ioperf_bdev_head, tailq) {
+        bdev_ioperf_write_config_json(&bdev->bdev, w);
+    }
+    spdk_json_write_batch_end(w);
+
+    return 0;
+}
+
+int
+bdev_ioperf_create(struct spdk_bdev **bdev, const struct ioperf_bdev_opts *opts)
+{
+    struct ioperf_bdev *ioperf;
+    uint32_t block_size;
+    int rc;
+
+    if (!opts) {
+        SPDK_ERRLOG("No options provided for ioperf bdev.\n");
+        return -EINVAL;
+    }
+
+    if (opts->num_blocks == 0) {
+        SPDK_ERRLOG("Disk must be more than 0 blocks\n");
+        return -EINVAL;
+    }
+
+    if (opts->block_size % 512 != 0) {
+        SPDK_ERRLOG("Data block size %u is not a multiple of 512.\n", opts->block_size);
+        return -EINVAL;
+    }
+
+    if (opts->physical_block_size % 512 != 0) {
+        SPDK_ERRLOG("Physical block must be 512 bytes aligned\n");
+        return -EINVAL;
+    }
+
+    block_size = opts->block_size;
+
+    ioperf = calloc(1, sizeof(*ioperf));
+    if (!ioperf) {
+        SPDK_ERRLOG("Could not allocate ioperf_bdev\n");
+        return -ENOMEM;
+    }
+
+    ioperf->bdev.name = strdup(opts->name);
+    if (!ioperf->bdev.name) {
+        free(ioperf);
+        return -ENOMEM;
+    }
+
+    ioperf->bdev.product_name = "ioperf disk";
+
+    ioperf->bdev.write_cache = 0;
+    ioperf->bdev.blocklen = block_size;
+    ioperf->bdev.phys_blocklen = opts->physical_block_size;
+    ioperf->bdev.blockcnt = opts->num_blocks;
+
+    /* Configuration */
+    ioperf->num_threads = opts->num_threads;
+    ioperf->read_latency_us = opts->read_latency_us;
+    ioperf->write_latency_us = opts->write_latency_us;
+    ioperf->max_iops = IOPERF_MAX_IOPS;
+    ioperf->max_bandwidth_mb = IOPERF_MAX_BANDWIDTH_MB;
+    ioperf->enable_validation = opts->enable_validation;
+
+    /* Initialize hash maps */
+    rc = ioperf_hash_map_init(&ioperf->hash_map_1, IOPERF_HASH_MAP_SIZE);
+    if (rc != 0) {
+        free(ioperf->bdev.name);
+        free(ioperf);
+        return rc;
+    }
+
+    rc = ioperf_hash_map_init(&ioperf->hash_map_2, IOPERF_HASH_MAP_SIZE);
+    if (rc != 0) {
+        ioperf_hash_map_destroy(&ioperf->hash_map_1);
+        free(ioperf->bdev.name);
+        free(ioperf);
+        return rc;
+    }
+
+    if (!spdk_uuid_is_null(&opts->uuid)) {
+        spdk_uuid_copy(&ioperf->bdev.uuid, &opts->uuid);
+    }
+
+    ioperf->bdev.ctxt = ioperf;
+    ioperf->bdev.fn_table = &ioperf_fn_table;
+    ioperf->bdev.module = &ioperf_if;
+
+    ioperf->total_io = 0;
+    ioperf->total_bytes = 0;
+
+    rc = spdk_bdev_register(&ioperf->bdev);
+    if (rc) {
+        ioperf_hash_map_destroy(&ioperf->hash_map_1);
+        ioperf_hash_map_destroy(&ioperf->hash_map_2);
+        free(ioperf->bdev.name);
+        free(ioperf);
+        return rc;
+    }
+
+    *bdev = &(ioperf->bdev);
+
+    TAILQ_INSERT_TAIL(&g_ioperf_bdev_head, ioperf, tailq);
+    g_ioperf_bdev = ioperf;
+
+    return rc;
+}
+
+void
+bdev_ioperf_delete(const char *bdev_name, spdk_delete_ioperf_complete cb_fn, void *cb_arg)
+{
+    struct ioperf_bdev *bdev = NULL;
+    struct spdk_bdev *found;
+
+    found = spdk_bdev_get_by_name(bdev_name);
+    if (!found) {
+        cb_fn(cb_arg, -ENODEV);
+        return;
+    }
+
+    bdev = found->ctxt;
+
+    spdk_bdev_unregister(&bdev->bdev, cb_fn, cb_arg);
+}
+
+int
+bdev_ioperf_resize(const char *bdev_name, const uint64_t new_size_in_mb)
+{
+    struct spdk_bdev *found;
+    struct ioperf_bdev *bdev;
+    uint64_t new_num_blocks;
+
+    found = spdk_bdev_get_by_name(bdev_name);
+    if (!found) {
+        return -ENODEV;
+    }
+
+    bdev = found->ctxt;
+
+    new_num_blocks = (new_size_in_mb * 1024 * 1024) / bdev->bdev.blocklen;
+
+    bdev->bdev.blockcnt = new_num_blocks;
+
+    return 0;
+}
+
+static int
+bdev_ioperf_initialize(void)
+{
+    /* Allocate read buffer */
+    g_ioperf_read_buf = spdk_zmalloc(SPDK_BDEV_LARGE_BUF_MAX_SIZE, 0x1000, NULL,
+                                      SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+    if (!g_ioperf_read_buf) {
+        SPDK_ERRLOG("Failed to allocate read buffer\n");
+        return -ENOMEM;
+    }
+
+    /* Initialize RPC handlers */
+    bdev_ioperf_rpc_init();
+
+    return 0;
+}
+
+static void
+bdev_ioperf_finish(void)
+{
+    if (g_ioperf_read_buf) {
+        spdk_free(g_ioperf_read_buf);
+        g_ioperf_read_buf = NULL;
+    }
+}
