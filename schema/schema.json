@@ -1128,6 +1128,57 @@
       ]
     },
     {
+      "name": "bdev_ioperf_create",
+      "params": [
+        {
+          "name": "name",
+          "type": "string",
+          "required": true,
+          "description": "Bdev name to use"
+        },
+        {
+          "name": "uuid",
+          "type": "uuid",
+          "description": "UUID of new bdev"
+        },
+        {
+          "name": "num_blocks",
+          "type": "uint64",
+          "description": "Number of blocks (default: 131072)"
+        },
+        {
+          "name": "block_size",
+          "type": "uint32",
+          "description": "Block size in bytes (default: 512)"
+        },
+        {
+          "name": "physical_block_size",
+          "type": "uint32",
+          "description": "Physical block size in bytes (default: 512)"
+        },
+        {
+          "name": "num_threads",
+          "type": "uint32",
+          "description": "Number of threads for I/O processing (default: 4)"
+        },
+        {
+          "name": "read_latency_us",
+          "type": "uint64",
+          "description": "Artificial read latency in microseconds"
+        },
+        {
+          "name": "write_latency_us",
+          "type": "uint64",
+          "description": "Artificial write latency in microseconds"
+        },
+        {
+          "name": "enable_validation",
+          "type": "boolean",
+          "description": "Enable data validation"
+        }
+      ]
+    },
+    {
       "name": "bdev_ocf_get_stats",
       "params": [
         {
