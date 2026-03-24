@@ -30,6 +30,9 @@ jobs:
             liburing-dev \
             python3 \
             python3-pip
+            meson
+            ninja-build
+            python3-tabulate
             # libfuse-dev
 
       - name: Configure
