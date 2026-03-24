@@ -29,6 +29,7 @@ jobs:
             liburing-dev \
             python3 \
             python3-pip
+            libfuse3-dev
 
       - name: Configure
         run: ./configure
