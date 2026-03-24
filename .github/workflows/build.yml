@@ -28,13 +28,12 @@ jobs:
             libssl-dev \
             uuid-dev \
             liburing-dev \
-            python3 \
-            python3-pip
-            python3-pip
+            python3
 
-      - name: Install meson and ninja
-        run: pip3 install meson ninja tabulate
-            # libfuse-dev
+      - name: Install meson, ninja and tabulate
+        run: |
+          sudo apt-get install -y python3-pip
+          pip3 install meson ninja tabulate
 
       - name: Configure
         run: ./configure --without-nvme-cuse
