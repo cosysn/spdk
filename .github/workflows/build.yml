@@ -54,6 +54,10 @@ jobs:
             help2man \
             systemtap-sdt-dev
 
+      - name: Install meson
+        run: |
+          pip3 install --user meson ninja
+
       - name: Configure
         run: |
           export PATH="$HOME/.local/bin:$PATH"
