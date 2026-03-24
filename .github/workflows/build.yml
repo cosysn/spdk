@@ -30,10 +30,10 @@ jobs:
             liburing-dev \
             python3 \
             python3-pip
-            libfuse-dev
+            # libfuse-dev
 
       - name: Configure
-        run: ./configure
+        run: ./configure --without-nvme-cuse
 
       - name: Build
         run: make -j$(nproc)
