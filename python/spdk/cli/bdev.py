@@ -1544,3 +1544,28 @@ def add_parser(subparsers):
     p.add_argument('name', help='DAOS bdev name')
     p.add_argument('new_size', help='new bdev size for resize operation. The unit is MiB', type=int)
     p.set_defaults(func=bdev_daos_resize)
+
+    # ioperf
+    def bdev_ioperf_create(args):
+        print_json(args.client.bdev_ioperf_create(
+            name=args.name,
+            uuid=args.uuid,
+            num_blocks=args.num_blocks,
+            block_size=args.block_size,
+            physical_block_size=args.physical_block_size,
+            num_threads=args.num_threads,
+            read_latency_us=args.read_latency_us,
+            write_latency_us=args.write_latency_us,
+            enable_validation=args.enable_validation))
+
+    p = subparsers.add_parser('bdev_ioperf_create', help='Add a bdev with ioperf backend (performance testing)')
+    p.add_argument('name', help='Block device name', required=True)
+    p.add_argument('-u', '--uuid', help='UUID of the bdev (optional)')
+    p.add_argument('-n', '--num-blocks', help='Number of blocks (default: 131072)', type=int)
+    p.add_argument('-b', '--block-size', help='Block size in bytes (default: 512)', type=int)
+    p.add_argument('-p', '--physical-block-size', help='Physical block size in bytes (default: 512)', type=int)
+    p.add_argument('-t', '--num-threads', help='Number of threads (default: 4)', type=int)
+    p.add_argument('-r', '--read-latency-us', help='Artificial read latency in microseconds', type=int)
+    p.add_argument('-w', '--write-latency-us', help='Artificial write latency in microseconds', type=int)
+    p.add_argument('-v', '--enable-validation', help='Enable data validation', action='store_true')
+    p.set_defaults(func=bdev_ioperf_create)
