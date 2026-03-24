@@ -55,10 +55,14 @@ jobs:
             systemtap-sdt-dev
 
       - name: Configure
-        run: ./configure --without-nvme-cuse
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          ./configure --without-nvme-cuse
 
       - name: Build
-        run: make -j$(nproc)
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          make -j$(nproc)
 
       - name: Run unit tests
         run: ./test/unit/unittest.sh
