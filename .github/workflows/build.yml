@@ -33,7 +33,7 @@ jobs:
       - name: Install meson, ninja and tabulate
         run: |
           sudo apt-get install -y python3-pip
-          pip3 install meson ninja tabulate
+          pip3 install meson ninja tabulate pyelftools
 
       - name: Configure
         run: ./configure --without-nvme-cuse
