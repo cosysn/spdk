@@ -1559,7 +1559,7 @@ def add_parser(subparsers):
             enable_validation=args.enable_validation))
 
     p = subparsers.add_parser('bdev_ioperf_create', help='Add a bdev with ioperf backend (performance testing)')
-    p.add_argument('name', help='Block device name', required=True)
+    p.add_argument('name', help='Block device name')
     p.add_argument('-u', '--uuid', help='UUID of the bdev (optional)')
     p.add_argument('-n', '--num-blocks', help='Number of blocks (default: 131072)', type=int)
     p.add_argument('-b', '--block-size', help='Block size in bytes (default: 512)', type=int)
