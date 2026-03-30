@@ -6,8 +6,8 @@ set -e
 
 # Configuration
 SPDK_DIR="${SPDK_DIR:-/home/ubuntu/spdk}"
-BDEV_NAME="ioperf0"
-NUM_BLOCKS=131072    # 512MB (512 * 131072 = 256MB)
+BDEV_NAME="malloc0"
+NUM_BLOCKS=65536    # 32MB
 BLOCK_SIZE=512
 TEST_DURATION=10
 CPU_MASK="0x3"      # Use 2 cores: core 0 and 1
@@ -44,10 +44,7 @@ cleanup() {
 # ============================================
 setup_hugepages() {
     echo "Setting up hugepages..."
-    HUGEPAGES=$(cat /proc/sys/vm/nr_hugepages 2>/dev/null || echo 0)
-    if [ "$HUGEPAGES" -lt 512 ]; then
-        echo 512 | sudo tee /proc/sys/vm/nr_hugepages > /dev/null 2>&1 || true
-    fi
+    echo 2048 | sudo tee /proc/sys/vm/nr_hugepages > /dev/null 2>&1 || true
     echo "Hugepages: $(cat /proc/sys/vm/nr_hugepages)"
 }
 
@@ -58,34 +55,33 @@ start_spdk_target() {
     echo "Starting SPDK target..."
 
     # Create config to enable ioperf bdev
-    CONFIG_JSON="/tmp/ioperf_config.json"
-    cat > "$CONFIG_JSON" << EOF
+    CONFIG_JSON="/var/tmp/ioperf_config.json"
+    cat > /var/tmp/ioperf_config.json << 'ENDFILE'
 {
   "subsystems": [
     {
       "subsystem": "bdev",
       "config": [
         {
-          "method": "bdev_ioperf_create",
+          "method": "bdev_malloc_create",
           "params": {
-            "name": "$BDEV_NAME",
-            "num_blocks": $NUM_BLOCKS,
-            "block_size": $BLOCK_SIZE,
-            "num_threads": 4
+            "name": "malloc0",
+            "num_blocks": 65536,
+            "block_size": 512
           }
         }
       ]
     }
   ]
 }
-EOF
+ENDFILE
 
     # Start target in background
     sudo "$SPDK_DIR/build/bin/spdk_tgt" \
         -m $CPU_MASK \
-        -s 512 \
+        -s 64 \
         -c "$CONFIG_JSON" \
-        > /tmp/spdk_tgt.log 2>&1 &
+        > /var/tmp/spdk_tgt.log 2>&1 &
     SPDK_PID=$!
 
     # Wait for target to start
@@ -94,7 +90,7 @@ EOF
     # Check if running
     if ! kill -0 $SPDK_PID 2>/dev/null; then
         echo -e "${RED}Error: spdk_tgt failed to start${NC}"
-        cat /tmp/spdk_tgt.log
+        cat /var/tmp/spdk_tgt.log
         exit 1
     fi
 
@@ -124,15 +120,14 @@ run_test() {
         -w $rw_type \
         -t $TEST_DURATION \
         -m $CPU_MASK \
-        -s 256 \
-        --no-huge \
-        2>&1 | tee /tmp/bdevperf_output.txt
+        -s 64 \
+        2>&1 | tee /var/tmp/bdevperf_output.txt
 
     # Extract results
     local iops bw lat
-    iops=$(grep -i "IOPS" /tmp/bdevperf_output.txt | head -1 | awk '{print $NF}' | tr -d ',')
-    bw=$(grep -i "MiB/s" /tmp/bdevperf_output.txt | head -1 | awk '{print $NF}' | tr -d ',')
-    lat=$(grep -i "latency" /tmp/bdevperf_output.txt | head -1 | awk '{print $NF}' || echo "N/A")
+    iops=$(grep -i "IOPS" /var/tmp/bdevperf_output.txt | head -1 | awk '{print $NF}' | tr -d ',')
+    bw=$(grep -i "MiB/s" /var/tmp/bdevperf_output.txt | head -1 | awk '{print $NF}' | tr -d ',')
+    lat=$(grep -i "latency" /var/tmp/bdevperf_output.txt | head -1 | awk '{print $NF}' || echo "N/A")
 
     if [ -z "$iops" ] || [ "$iops" = "0" ]; then
         iops="FAILED"
