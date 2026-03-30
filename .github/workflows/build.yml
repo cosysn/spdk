@@ -2,7 +2,7 @@ name: Build SPDK
 
 on:
   push:
-    branches: [master, '**']
+    branches: [master]
   pull_request:
     branches: [master]
   workflow_dispatch:
@@ -71,9 +71,12 @@ jobs:
       - name: Run unit tests
         run: ./test/unit/unittest.sh
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+      - name: Upload to Release
+        if: github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
         with:
-          name: spdk-binaries
-          path: build/bin/
-          retention-days: 7
+          files: build/bin/*
+          name: SPDK Build ${{ github.sha }}
+          draft: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
