@@ -56,7 +56,7 @@ jobs:
 
       - name: Install meson
         run: |
-          pip3 install --user meson ninja
+          pip3 install --user meson ninja pyelftools
 
       - name: Configure
         run: |
