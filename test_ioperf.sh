@@ -6,7 +6,7 @@ set -e
 
 # Configuration
 SPDK_DIR="${SPDK_DIR:-/home/ubuntu/spdk}"
-BDEV_NAME="malloc0"
+BDEV_NAME="ioperf0"
 NUM_BLOCKS=65536    # 32MB
 BLOCK_SIZE=512
 TEST_DURATION=10
@@ -61,11 +61,12 @@ start_spdk_target() {
       "subsystem": "bdev",
       "config": [
         {
-          "method": "bdev_malloc_create",
+          "method": "bdev_ioperf_create",
           "params": {
-            "name": "malloc0",
+            "name": "ioperf0",
             "num_blocks": 65536,
-            "block_size": 512
+            "block_size": 512,
+            "num_threads": 2
           }
         }
       ]
