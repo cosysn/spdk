@@ -106,7 +106,7 @@ jobs:
       - name: Configure ARM64
         run: |
           export PATH="$HOME/.local/bin:$PATH"
-          CC=aarch64-linux-gnu-gcc CXX=aarch64-linux-gnu-g++ ./configure --without-nvme-cuse --target-arch=arm64
+          CC=aarch64-linux-gnu-gcc CXX=aarch64-linux-gnu-g++ ./configure --without-nvme-cuse --target-arch=arm64 --disable-isa-l
 
       - name: Build ARM64
         run: |
