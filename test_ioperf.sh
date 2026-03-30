@@ -10,7 +10,7 @@ BDEV_NAME="malloc0"
 NUM_BLOCKS=65536    # 32MB
 BLOCK_SIZE=512
 TEST_DURATION=10
-CPU_MASK="0x3"      # Use 2 cores: core 0 and 1
+CPU_MASK="0x1"      # Use 1 core for limited memory environment
 
 # Colors
 RED='\033[0;31m'
@@ -40,12 +40,10 @@ cleanup() {
 }
 
 # ============================================
-# Setup hugepages
+# Setup hugepages (no-op for this environment)
 # ============================================
 setup_hugepages() {
-    echo "Setting up hugepages..."
-    echo 2048 | sudo tee /proc/sys/vm/nr_hugepages > /dev/null 2>&1 || true
-    echo "Hugepages: $(cat /proc/sys/vm/nr_hugepages)"
+    echo "No hugepages setup needed for no-huge mode"
 }
 
 # ============================================
@@ -76,10 +74,11 @@ start_spdk_target() {
 }
 ENDFILE
 
-    # Start target in background
+    # Start target in background (using no-huge due to limited hugepages)
     sudo "$SPDK_DIR/build/bin/spdk_tgt" \
-        -m $CPU_MASK \
-        -s 64 \
+        -m 0x1 \
+        -s 16 \
+        --no-huge \
         -c "$CONFIG_JSON" \
         > /var/tmp/spdk_tgt.log 2>&1 &
     SPDK_PID=$!
@@ -114,13 +113,14 @@ run_test() {
 
     # Run test
     sudo "$SPDK_DIR/build/examples/bdevperf" \
-        -b "$BDEV_NAME" \
+        -T "$BDEV_NAME" \
         -q $iod \
         -o $bs \
         -w $rw_type \
         -t $TEST_DURATION \
-        -m $CPU_MASK \
-        -s 64 \
+        -m 0x1 \
+        -s 16 \
+        --no-huge \
         2>&1 | tee /var/tmp/bdevperf_output.txt
 
     # Extract results
@@ -150,10 +150,14 @@ main() {
 
     cleanup
     setup_hugepages
+
+    # Wait for hugepages to be ready
+    sleep 3
+
     start_spdk_target
 
     # Wait for bdev to be ready
-    sleep 2
+    sleep 3
 
     echo ""
     echo -e "${GREEN}Starting tests...${NC}"
