@@ -75,8 +75,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: build/bin/*
+          tag_name: ${{ github.sha }}
           name: SPDK Build ${{ github.sha }}
           draft: false
-          overwrite: true
+          overwrite_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
