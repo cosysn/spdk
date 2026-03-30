@@ -172,15 +172,19 @@ ioperf_reg_access(volatile uint32_t *reg)
 {
     uint32_t val;
     int i;
+    uint64_t start_ticks = spdk_get_ticks();
+    /* 500ns fixed delay regardless of CPU frequency */
+    uint64_t delay_ticks = spdk_get_ticks_hz() / 2000000;  /* 500ns = hz/2000000 */
 
-    /* 4 register accesses, ~600ns each = ~2400ns total */
+    /* 4 register accesses, ~500ns each = ~2000ns total */
     for (i = 0; i < 4; i++) {
         val = *reg;  /* read */
         *reg = val;  /* write */
-        /* Busy wait ~600ns (~1500 ticks at 2.5GHz) */
-        for (val = 0; val < 1500; val++) {
+        /* Busy wait fixed 500ns */
+        while ((spdk_get_ticks() - start_ticks) < delay_ticks) {
             __asm__ volatile("" ::: "memory");
         }
+        start_ticks = spdk_get_ticks();
     }
 }
 
@@ -193,7 +197,7 @@ ioperf_process_io_on_target(void *ctx)
     struct ioperf_bdev *ioperf = (struct ioperf_bdev *)bdev_io->bdev->ctxt;
     volatile uint32_t reg dummy = 0;
 
-    /* 4 hardware register accesses with ~600ns delay each */
+    /* 4 hardware register accesses with ~500ns delay each */
     ioperf_reg_access(&dummy);
 
     /* Fill hash map values */
