@@ -200,9 +200,9 @@ ioperf_mem_barrier(void)
     }
 }
 
-/* Process I/O on target thread */
+/* Delayed IO processing - runs after 100us delay */
 static void
-ioperf_process_io_on_target(void *ctx)
+ioperf_delayed_process(void *ctx)
 {
     struct ioperf_io_ctx *io_ctx = (struct ioperf_io_ctx *)ctx;
     struct spdk_bdev_io *bdev_io = io_ctx->bio;
@@ -224,6 +224,23 @@ ioperf_process_io_on_target(void *ctx)
 
     /* Send completion back to source thread */
     spdk_thread_send_msg(io_ctx->src_thread, ioperf_complete_io, io_ctx);
+}
+
+/* Process I/O on target thread */
+static void
+ioperf_process_io_on_target(void *ctx)
+{
+    struct ioperf_io_ctx *io_ctx = (struct ioperf_io_ctx *)ctx;
+
+    /* 100us IO latency - queue to current thread first */
+    uint64_t start_ticks = spdk_get_ticks();
+    uint64_t delay_ticks = spdk_get_ticks_hz() / 10;  /* 100us = hz/10 */
+    while ((spdk_get_ticks() - start_ticks) < delay_ticks) {
+        __asm__ volatile("" ::: "memory");
+    }
+
+    /* Then process after delay */
+    spdk_thread_send_msg(spdk_get_thread(), ioperf_delayed_process, io_ctx);
 }
 
 static void
