@@ -176,8 +176,8 @@ ioperf_reg_access(volatile uint32_t *reg)
     /* 500ns fixed delay regardless of CPU frequency */
     uint64_t delay_ticks = spdk_get_ticks_hz() / 2000000;  /* 500ns = hz/2000000 */
 
-    /* 4 register accesses, ~500ns each = ~2000ns total */
-    for (i = 0; i < 4; i++) {
+    /* 8 register accesses, ~500ns each = ~4000ns total */
+    for (i = 0; i < 8; i++) {
         val = *reg;  /* read */
         *reg = val;  /* write */
         /* Busy wait fixed 500ns */
