@@ -77,7 +77,7 @@ jobs:
         with:
           files: |
             build/bin/*
-            build/examples/bdev/bdevperf
+            build/examples/bdevperf
           tag_name: build-${{ github.sha }}
           name: SPDK Build ${{ github.sha }}
           draft: false

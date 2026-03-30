@@ -117,7 +117,7 @@ run_test() {
     sleep 1
 
     # Run test
-    sudo "$SPDK_DIR/build/examples/bdev/bdevperf" \
+    sudo "$SPDK_DIR/build/examples/bdevperf" \
         -b "$BDEV_NAME" \
         -q $iod \
         -o $bs \
