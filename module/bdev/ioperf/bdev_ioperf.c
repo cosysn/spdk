@@ -33,6 +33,7 @@ static int bdev_ioperf_config_json(struct spdk_json_write_ctx *w);
 static void fill_all_fields(struct ioperf_io_ctx *ctx);
 static void ioperf_process_io_on_target(void *ctx);
 static void ioperf_complete_io(void *ctx);
+static int ioperf_delay_poll(void *ctx);
 
 static int
 bdev_ioperf_get_ctx_size(void)
@@ -93,6 +94,9 @@ ioperf_bdev_create_cb(void *io_device, void *ctx_buf)
     ch->last_time = spdk_get_ticks();
     ch->token_bucket = 0;
     ch->thread_id = spdk_thread_get_id(spdk_get_thread());
+
+    /* Register poller to check delayed IO queue */
+    ch->delay_poller = spdk_poller_register(ioperf_delay_poll, ch, 100);  /* poll every 100us */
 
     return 0;
 }
@@ -168,18 +172,19 @@ ioperf_complete_io(void *ctx)
 
 /* Simulate hardware register access with busy-wait delay */
 static void
-ioperf_reg_access(volatile uint32_t *reg)
+ioperf_reg_access(void)
 {
     uint32_t val;
     int i;
     uint64_t start_ticks = spdk_get_ticks();
     /* 500ns fixed delay regardless of CPU frequency */
     uint64_t delay_ticks = spdk_get_ticks_hz() / 2000000;  /* 500ns = hz/2000000 */
+    static uint32_t dummy = 0;
 
     /* 4 register accesses, ~500ns each = ~2000ns total */
     for (i = 0; i < 4; i++) {
-        val = *reg;  /* read */
-        *reg = val;  /* write */
+        val = dummy;  /* read */
+        dummy = val;  /* write */
         /* Busy wait fixed 500ns */
         while ((spdk_get_ticks() - start_ticks) < delay_ticks) {
             __asm__ volatile("" ::: "memory");
@@ -207,10 +212,9 @@ ioperf_delayed_process(void *ctx)
     struct ioperf_io_ctx *io_ctx = (struct ioperf_io_ctx *)ctx;
     struct spdk_bdev_io *bdev_io = io_ctx->bio;
     struct ioperf_bdev *ioperf = (struct ioperf_bdev *)bdev_io->bdev->ctxt;
-    volatile uint32_t reg dummy = 0;
 
     /* 4 hardware register accesses with ~500ns delay each */
-    ioperf_reg_access(&dummy);
+    ioperf_reg_access();
 
     /* 8 memory barriers */
     ioperf_mem_barrier();
@@ -226,21 +230,40 @@ ioperf_delayed_process(void *ctx)
     spdk_thread_send_msg(io_ctx->src_thread, ioperf_complete_io, io_ctx);
 }
 
-/* Process I/O on target thread */
+/* Check and process delayed IOs */
+static int
+ioperf_delay_poll(void *ctx)
+{
+    struct ioperf_io_channel *ch = (struct ioperf_io_channel *)ctx;
+    struct ioperf_io_ctx *io_ctx, *tmp;
+    uint64_t now = spdk_get_ticks();
+    uint64_t delay_ticks = spdk_get_ticks_hz() / 10;  /* 100us */
+
+    TAILQ_FOREACH_SAFE(io_ctx, &ch->wait_queue, link, tmp) {
+        if (now - io_ctx->queued_io >= delay_ticks) {
+            /* Remove from queue */
+            TAILQ_REMOVE(&ch->wait_queue, io_ctx, link);
+            /* Process after delay */
+            spdk_thread_send_msg(spdk_get_thread(), ioperf_delayed_process, io_ctx);
+        }
+    }
+
+    return 0;
+}
+
+/* Process I/O on target thread - add to queue for async delay */
 static void
 ioperf_process_io_on_target(void *ctx)
 {
     struct ioperf_io_ctx *io_ctx = (struct ioperf_io_ctx *)ctx;
+    struct ioperf_io_channel *ch;
 
-    /* 100us IO latency - queue to current thread first */
-    uint64_t start_ticks = spdk_get_ticks();
-    uint64_t delay_ticks = spdk_get_ticks_hz() / 10;  /* 100us = hz/10 */
-    while ((spdk_get_ticks() - start_ticks) < delay_ticks) {
-        __asm__ volatile("" ::: "memory");
-    }
+    /* Get IO channel */
+    ch = spdk_io_channel_get_ctx(spdk_bdev_io_get_io_channel(io_ctx->bio));
 
-    /* Then process after delay */
-    spdk_thread_send_msg(spdk_get_thread(), ioperf_delayed_process, io_ctx);
+    /* Add to wait queue with timestamp */
+    io_ctx->queued_io = spdk_get_ticks();
+    TAILQ_INSERT_TAIL(&ch->wait_queue, io_ctx, link);
 }
 
 static void

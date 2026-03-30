@@ -86,6 +86,7 @@ struct ioperf_io_channel {
     uint64_t                        last_time;
     uint64_t                        token_bucket;
     uint32_t                        thread_id;
+    struct spdk_poller             *delay_poller;
 };
 
 /* IO request structure - allocated from memory pool */
@@ -96,6 +97,9 @@ struct ioperf_io_ctx {
     /* Routing info */
     uint32_t                   target_thread;
     struct spdk_thread         *src_thread;
+
+    /* Delay timestamp */
+    uint64_t                   queued_io;
 
     /* Hash map values */
     int                        hash_map_value_1;
