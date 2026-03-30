@@ -166,6 +166,24 @@ ioperf_complete_io(void *ctx)
     spdk_mempool_put(ioperf->io_pool, io_ctx);
 }
 
+/* Simulate hardware register access with busy-wait delay */
+static void
+ioperf_reg_access(volatile uint32_t *reg)
+{
+    uint32_t val;
+    int i;
+
+    /* 4 register accesses, ~600ns each = ~2400ns total */
+    for (i = 0; i < 4; i++) {
+        val = *reg;  /* read */
+        *reg = val;  /* write */
+        /* Busy wait ~600ns (~1500 ticks at 2.5GHz) */
+        for (val = 0; val < 1500; val++) {
+            __asm__ volatile("" ::: "memory");
+        }
+    }
+}
+
 /* Process I/O on target thread */
 static void
 ioperf_process_io_on_target(void *ctx)
@@ -173,6 +191,10 @@ ioperf_process_io_on_target(void *ctx)
     struct ioperf_io_ctx *io_ctx = (struct ioperf_io_ctx *)ctx;
     struct spdk_bdev_io *bdev_io = io_ctx->bio;
     struct ioperf_bdev *ioperf = (struct ioperf_bdev *)bdev_io->bdev->ctxt;
+    volatile uint32_t reg dummy = 0;
+
+    /* 4 hardware register accesses with ~600ns delay each */
+    ioperf_reg_access(&dummy);
 
     /* Fill hash map values */
     io_ctx->hash_map_value_1 = (int)(bdev_io->u.bdev.offset_blocks % ioperf->hash_map_1.size);
