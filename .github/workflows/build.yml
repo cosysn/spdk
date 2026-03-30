@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  build-x86:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -72,12 +72,69 @@ jobs:
       - name: Run unit tests
         run: ./test/unit/unittest.sh
 
-      - name: Upload to Release
+      - name: Upload x86 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: spdk-x86
+          path: |
+            build/bin/
+            build/examples/bdevperf
+          retention-days: 7
+
+  build-arm64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install cross-compile toolchain
+        run: |
+          sudo rm -rf /var/lib/apt/lists/*
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            libc6-dev-arm64-cross \
+            libncurses5-dev \
+            crossbuild-essential-arm64
+
+      - name: Install meson
+        run: |
+          pip3 install --user meson ninja pyelftools
+
+      - name: Configure ARM64
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          CC=aarch64-linux-gnu-gcc CXX=aarch64-linux-gnu-g++ ./configure --without-nvme-cuse --target-arch=arm64
+
+      - name: Build ARM64
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          make -j$(nproc)
+
+      - name: Upload ARM64 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: spdk-arm64
+          path: build/bin/
+          retention-days: 7
+
+  release:
+    needs: [build-x86, build-arm64]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            build/bin/*
-            build/examples/bdevperf
+            artifacts/spdk-x86/*
+            artifacts/spdk-arm64/*
           tag_name: build-${{ github.sha }}
           name: SPDK Build ${{ github.sha }}
           draft: false
