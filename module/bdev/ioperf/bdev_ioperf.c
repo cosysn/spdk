@@ -188,6 +188,18 @@ ioperf_reg_access(volatile uint32_t *reg)
     }
 }
 
+/* Simulate memory barrier access */
+static void
+ioperf_mem_barrier(void)
+{
+    int i;
+
+    /* 8 memory barriers */
+    for (i = 0; i < 8; i++) {
+        __asm__ volatile("mfence" ::: "memory");
+    }
+}
+
 /* Process I/O on target thread */
 static void
 ioperf_process_io_on_target(void *ctx)
@@ -199,6 +211,9 @@ ioperf_process_io_on_target(void *ctx)
 
     /* 4 hardware register accesses with ~500ns delay each */
     ioperf_reg_access(&dummy);
+
+    /* 8 memory barriers */
+    ioperf_mem_barrier();
 
     /* Fill hash map values */
     io_ctx->hash_map_value_1 = (int)(bdev_io->u.bdev.offset_blocks % ioperf->hash_map_1.size);
