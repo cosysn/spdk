@@ -238,10 +238,7 @@ ioperf_wait_poll(void *ctx)
             rl_ctx->target_thread = target_thread_idx;
             rl_ctx->hash_map_value_1 = (int)(rl_ctx->bio->u.bdev.offset_blocks % ioperf->hash_map_1.size);
             rl_ctx->hash_map_value_2 = (int)((rl_ctx->bio->u.bdev.offset_blocks / 1000) % ioperf->hash_map_2.size);
-            if (spdk_thread_send_msg(target_thread, ioperf_process_io_on_target, rl_ctx) != 0) {
-                SPDK_ERRLOG("ioperf: msg ring full, processing sync\n");
-                ioperf_process_io_on_target(rl_ctx);
-            }
+            spdk_thread_send_msg(target_thread, ioperf_process_io_on_target, rl_ctx);
         }
     }
 
@@ -592,11 +589,7 @@ bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bde
     io_ctx->hash_map_value_2 = (int)((lba / 1000) % ioperf->hash_map_2.size);
 
     /* Send to target thread (including same thread) for 100us delay */
-    if (spdk_thread_send_msg(target_thread, ioperf_process_io_on_target, io_ctx) != 0) {
-        /* Ring full - process immediately (synchronous) */
-        SPDK_ERRLOG("ioperf: msg ring full, processing sync\n");
-        ioperf_process_io_on_target(io_ctx);
-    }
+    spdk_thread_send_msg(target_thread, ioperf_process_io_on_target, io_ctx);
 }
 
 static bool
