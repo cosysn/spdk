@@ -253,13 +253,15 @@ static void
 ioperf_process_io_on_target(void *ctx)
 {
     struct ioperf_io_ctx *io_ctx = (struct ioperf_io_ctx *)ctx;
+    struct spdk_io_channel *target_ch;
     struct ioperf_io_channel *ch;
     struct ioperf_io_ctx *wait_ctx, *tmp;
     uint64_t now = spdk_get_ticks();
     uint64_t delay_ticks = spdk_get_ticks_hz() / 10;  /* 100us */
 
-    /* Get IO channel */
-    ch = spdk_io_channel_get_ctx(spdk_bdev_io_get_io_channel(io_ctx->bio));
+    /* Get target thread's IO channel */
+    target_ch = spdk_get_io_channel(&g_ioperf_bdev_head);
+    ch = spdk_io_channel_get_ctx(target_ch);
 
     /* Check wait queue - process any IO that has been waiting >100us */
     TAILQ_FOREACH_SAFE(wait_ctx, &ch->wait_queue, link, tmp) {
