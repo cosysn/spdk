@@ -112,6 +112,32 @@ cleanup:
 }
 SPDK_RPC_REGISTER("bdev_ioperf_create", rpc_bdev_ioperf_create, SPDK_RPC_RUNTIME)
 
+/* RPC to register current thread's poller for ioperf */
+static void
+rpc_bdev_ioperf_register_thread(struct spdk_jsonrpc_request *request,
+			    const struct spdk_json_val *params)
+{
+	struct spdk_io_channel *ch;
+	struct ioperf_io_channel *ioperf_ch;
+
+	/* Get the IO channel - this will create the channel and poller
+	 * for the current thread if it doesn't exist yet
+	 */
+	ch = spdk_get_io_channel(&g_ioperf_bdev_head);
+	if (!ch) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						"Failed to get IO channel");
+		return;
+	}
+
+	ioperf_ch = spdk_io_channel_get_ctx(ch);
+	SPDK_NOTICELOG("ioperf: registered thread %" PRIu64 " for wait queue processing\n",
+		      spdk_thread_get_id(spdk_get_thread()));
+
+	spdk_jsonrpc_send_bool_response(request, true);
+}
+SPDK_RPC_REGISTER("bdev_ioperf_register_thread", rpc_bdev_ioperf_register_thread, SPDK_RPC_RUNTIME)
+
 int
 bdev_ioperf_rpc_init(void)
 {

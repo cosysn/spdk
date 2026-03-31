@@ -42,6 +42,9 @@
 struct ioperf_bdev;
 struct ioperf_io_ctx;
 
+/* Global ioperf bdev list head - exported for RPC */
+TAILQ_HEAD(, ioperf_bdev) g_ioperf_bdev_head;
+
 /* Hash map structure */
 struct ioperf_hash_map {
     pthread_rwlock_t    lock;

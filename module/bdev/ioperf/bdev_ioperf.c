@@ -21,8 +21,8 @@
 /* RPC handlers are in bdev_ioperf_rpc.c */
 extern int bdev_ioperf_rpc_init(void);
 
-static TAILQ_HEAD(, ioperf_bdev) g_ioperf_bdev_head = TAILQ_HEAD_INITIALIZER(g_ioperf_bdev_head);
-static struct ioperf_bdev *g_ioperf_bdev = NULL;
+/* Global ioperf bdev list - defined in bdev_ioperf.c */
+extern struct ioperf_bdev *g_ioperf_bdev;
 
 #define MAX_QUEUED_IO 1024
 
