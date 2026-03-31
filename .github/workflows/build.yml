@@ -2,7 +2,7 @@ name: Build SPDK
 
 on:
   push:
-    branches: [master, ioperf]
+    branches: [master, ioperf, ioperf_v22.01]
   pull_request:
     branches: [master]
   workflow_dispatch:
