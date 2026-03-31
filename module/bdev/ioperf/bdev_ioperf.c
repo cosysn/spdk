@@ -32,8 +32,8 @@ static int bdev_ioperf_config_json(struct spdk_json_write_ctx *w);
 
 /* Forward declarations */
 static void fill_all_fields(struct ioperf_io_ctx *ctx);
+static bool rate_limit_check(struct ioperf_io_channel *ch, struct ioperf_bdev *ioperf, struct ioperf_io_ctx *io_ctx);
 static void ioperf_process_io_on_target(void *ctx);
-static void ioperf_complete_io(void *ctx);
 static int ioperf_wait_poll(void *ctx);
 
 static int
@@ -91,6 +91,7 @@ ioperf_bdev_create_cb(void *io_device, void *ctx_buf)
     struct ioperf_io_channel *ch = ctx_buf;
 
     TAILQ_INIT(&ch->wait_queue);
+    TAILQ_INIT(&ch->rate_limit_queue);
     ch->queued_io = 0;
     ch->last_time = spdk_get_ticks();
     ch->token_bucket = 0;
@@ -206,12 +207,37 @@ ioperf_wait_poll(void *ctx)
     TAILQ_FOREACH_SAFE(wait_ctx, &ch->wait_queue, link, tmp) {
         if (now - wait_ctx->queued_io >= delay_ticks) {
             TAILQ_REMOVE(&ch->wait_queue, wait_ctx, link);
+            /* Simulate hardware register access delay */
+            ioperf_reg_access();
+            /* Memory barrier */
+            ioperf_mem_barrier();
             fill_all_fields(wait_ctx);
             spdk_bdev_io_complete(wait_ctx->bio, SPDK_BDEV_IO_STATUS_SUCCESS);
             struct ioperf_bdev *ioperf = (struct ioperf_bdev *)wait_ctx->bio->bdev->ctxt;
             ioperf->total_io++;
             ioperf->total_bytes += wait_ctx->bio->u.bdev.num_blocks * wait_ctx->bio->bdev->blocklen;
             spdk_mempool_put(ioperf->io_pool, wait_ctx);
+        }
+    }
+
+    /* Process rate limit queue - try to resubmit IO */
+    struct ioperf_io_ctx *rl_ctx, *rl_tmp;
+    TAILQ_FOREACH_SAFE(rl_ctx, &ch->rate_limit_queue, link, rl_tmp) {
+        struct ioperf_bdev *ioperf = (struct ioperf_bdev *)rl_ctx->bio->bdev->ctxt;
+        if (rate_limit_check(ch, ioperf, rl_ctx)) {
+            /* Rate limit passed, resubmit to target thread */
+            TAILQ_REMOVE(&ch->rate_limit_queue, rl_ctx, link);
+            uint32_t target_thread_idx = ioperf_hash_lba(rl_ctx->bio->u.bdev.offset_blocks, ioperf->num_threads);
+            struct spdk_thread *target_thread;
+            if (ioperf->thread_pool && ioperf->thread_pool_size > 0) {
+                target_thread = ioperf->thread_pool[target_thread_idx % ioperf->thread_pool_size];
+            } else {
+                target_thread = rl_ctx->src_thread;
+            }
+            rl_ctx->target_thread = target_thread_idx;
+            rl_ctx->hash_map_value_1 = (int)(rl_ctx->bio->u.bdev.offset_blocks % ioperf->hash_map_1.size);
+            rl_ctx->hash_map_value_2 = (int)((rl_ctx->bio->u.bdev.offset_blocks / 1000) % ioperf->hash_map_2.size);
+            spdk_thread_send_msg(target_thread, ioperf_process_io_on_target, rl_ctx);
         }
     }
 
@@ -387,7 +413,7 @@ fill_all_fields(struct ioperf_io_ctx *ctx)
 }
 
 static bool
-rate_limit_check(struct ioperf_io_channel *ch, struct ioperf_bdev *ioperf, struct spdk_bdev_io *bdev_io)
+rate_limit_check(struct ioperf_io_channel *ch, struct ioperf_bdev *ioperf, struct ioperf_io_ctx *io_ctx)
 {
     if (ioperf == NULL) {
         return true;
@@ -412,12 +438,15 @@ rate_limit_check(struct ioperf_io_channel *ch, struct ioperf_bdev *ioperf, struc
         ch->last_time = now;
     }
 
-    uint64_t io_size = bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen;
+    uint64_t io_size = io_ctx->bio->u.bdev.num_blocks * io_ctx->bio->bdev->blocklen;
 
     if (ch->queued_io < MAX_QUEUED_IO && ch->token_bucket >= io_size) {
         ch->token_bucket -= io_size;
         return true;
     }
+
+    /* Rate limited - add to rate limit queue for retry */
+    TAILQ_INSERT_TAIL(&ch->rate_limit_queue, io_ctx, link);
     return false;
 }
 
@@ -494,7 +523,6 @@ bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bde
     struct spdk_thread *current_thread = spdk_get_thread();
     struct spdk_thread *target_thread;
     uint32_t i;
-    bool same_thread;
 
     /* Get ioperf bdev from bdev context */
     ioperf = (struct ioperf_bdev *)bdev_io->bdev->ctxt;
@@ -517,11 +545,22 @@ bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bde
         }
     }
 
-    /* Check rate limit first on source thread */
+    /* Allocate IO context from memory pool first */
+    io_ctx = spdk_mempool_get(ioperf->io_pool);
+    if (!io_ctx) {
+        SPDK_ERRLOG("Failed to get IO context from pool\n");
+        spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+        return;
+    }
+
+    /* Initialize IO context */
+    io_ctx->bio = bdev_io;
+    io_ctx->src_thread = spdk_bdev_io_get_thread(bdev_io);
+
+    /* Check rate limit on source thread */
     struct ioperf_io_channel *src_ch = spdk_io_channel_get_ctx(_ch);
-    if (!rate_limit_check(src_ch, ioperf, bdev_io)) {
-        /* Rate limited - complete with success anyway (simulate full speed) */
-        spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+    if (!rate_limit_check(src_ch, ioperf, io_ctx)) {
+        /* Rate limited - IO added to rate_limit_queue, will retry */
         return;
     }
 
@@ -535,44 +574,18 @@ bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bde
         target_thread = current_thread;
     }
 
-    /* Check if target thread is same as current thread */
-    same_thread = (target_thread == current_thread);
-
-    /* Allocate IO context from memory pool */
-    io_ctx = spdk_mempool_get(ioperf->io_pool);
+    io_ctx->target_thread = target_thread_idx;
     if (!io_ctx) {
         SPDK_ERRLOG("Failed to get IO context from pool\n");
         spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
         return;
     }
 
-    /* Initialize IO context */
-    io_ctx->bio = bdev_io;
-    io_ctx->target_thread = target_thread_idx;
-    io_ctx->src_thread = spdk_bdev_io_get_thread(bdev_io);
-
     /* Fill hash map values */
     io_ctx->hash_map_value_1 = (int)(lba % ioperf->hash_map_1.size);
     io_ctx->hash_map_value_2 = (int)((lba / 1000) % ioperf->hash_map_2.size);
 
-    /* If target thread is same as current, process directly */
-    if (same_thread) {
-        /* Fill all 100+ fields directly */
-        fill_all_fields(io_ctx);
-
-        /* Complete the I/O */
-        spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
-
-        /* Update stats */
-        ioperf->total_io++;
-        ioperf->total_bytes += bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen;
-
-        /* Free IO context back to pool */
-        spdk_mempool_put(ioperf->io_pool, io_ctx);
-        return;
-    }
-
-    /* Send I/O to target thread for processing */
+    /* Send to target thread (including same thread) for 100us delay */
     spdk_thread_send_msg(target_thread, ioperf_process_io_on_target, io_ctx);
 }
 

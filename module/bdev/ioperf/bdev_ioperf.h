@@ -81,7 +81,8 @@ struct ioperf_bdev {
 
 /* IO channel structure (per thread) */
 struct ioperf_io_channel {
-    TAILQ_HEAD(, ioperf_io_ctx)    wait_queue;
+    TAILQ_HEAD(, ioperf_io_ctx)    wait_queue;      /* IO waiting for 100us delay */
+    TAILQ_HEAD(, ioperf_io_ctx)    rate_limit_queue; /* IO waiting for rate limit */
     uint64_t                        queued_io;
     uint64_t                        last_time;
     uint64_t                        token_bucket;
