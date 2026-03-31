@@ -34,6 +34,11 @@
 
 #include "spdk/stdinc.h"
 
+/* Modern glibc (2.36+) provides arc4random */
+#if defined(__GLIBC__) && defined(__GLIBC_MINOR__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 36))
+#define HAVE_ARC4RANDOM 1
+#endif
+
 #include "spdk/base64.h"
 #include "spdk/crc32.h"
 #include "spdk/endian.h"
@@ -77,7 +82,7 @@ struct spdk_iscsi_globals g_iscsi = {
 	    | (((uint32_t) *((uint8_t *)(BUF)+3)) << 24))	\
 	    == (CRC32C))
 
-#ifndef SPDK_CONFIG_HAVE_ARC4RANDOM
+#ifndef HAVE_ARC4RANDOM
 static void
 srandomdev(void)
 {
