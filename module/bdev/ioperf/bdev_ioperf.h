@@ -240,7 +240,6 @@ struct ioperf_io_ctx {
 /* Options for creating ioperf bdev */
 struct ioperf_bdev_opts {
     char                *name;
-    struct spdk_uuid   uuid;
     uint64_t           num_blocks;
     uint32_t           block_size;
     uint32_t           physical_block_size;

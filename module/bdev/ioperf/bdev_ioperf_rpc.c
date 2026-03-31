@@ -22,7 +22,6 @@ int bdev_ioperf_rpc_init(void);
 /* RPC request context structure for bdev_ioperf_create */
 struct rpc_bdev_ioperf_create_ctx {
 	char *name;
-	struct spdk_uuid uuid;
 	uint64_t num_blocks;
 	uint32_t block_size;
 	uint32_t physical_block_size;
@@ -40,7 +39,6 @@ free_rpc_bdev_ioperf_create(struct rpc_bdev_ioperf_create_ctx *ctx)
 
 static const struct spdk_json_object_decoder rpc_bdev_ioperf_create_decoders[] = {
 	{"name", offsetof(struct rpc_bdev_ioperf_create_ctx, name), spdk_json_decode_string},
-	{"uuid", offsetof(struct rpc_bdev_ioperf_create_ctx, uuid), spdk_json_decode_uuid, true},
 	{"num_blocks", offsetof(struct rpc_bdev_ioperf_create_ctx, num_blocks), spdk_json_decode_uint64, true},
 	{"block_size", offsetof(struct rpc_bdev_ioperf_create_ctx, block_size), spdk_json_decode_uint32, true},
 	{"physical_block_size", offsetof(struct rpc_bdev_ioperf_create_ctx, physical_block_size), spdk_json_decode_uint32, true},
@@ -91,7 +89,6 @@ rpc_bdev_ioperf_create(struct spdk_jsonrpc_request *request,
 
 	/* Copy to opts */
 	opts.name = req.name;
-	opts.uuid = req.uuid;
 	opts.num_blocks = req.num_blocks;
 	opts.block_size = req.block_size;
 	opts.physical_block_size = req.physical_block_size;
