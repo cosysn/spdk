@@ -128,18 +128,6 @@ ioperf_hash_map_destroy(struct ioperf_hash_map *hash_map)
     pthread_rwlock_destroy(&hash_map->lock);
 }
 
-static int
-ioperf_hash_map_get(struct ioperf_hash_map *hash_map, int key, int *value)
-{
-    int idx = key % (int)hash_map->size;
-
-    pthread_rwlock_rdlock(&hash_map->lock);
-    *value = hash_map->values[idx];
-    pthread_rwlock_unlock(&hash_map->lock);
-
-    return 0;
-}
-
 static uint32_t
 ioperf_hash_lba(uint64_t lba, uint32_t num_threads)
 {
@@ -437,15 +425,6 @@ rate_limit_check(struct ioperf_io_channel *ch, struct ioperf_bdev *ioperf, struc
     return false;
 }
 
-/* Worker thread stub function - not currently used but kept for future */
-static int
-ioperf_worker_thread_stub(void *arg)
-{
-    /* This thread just processes messages sent to it */
-    /* No poller needed - thread_run() will poll for messages */
-    return 0;
-}
-
 /* Initialize thread pool - will collect threads as they call submit_request */
 static int
 ioperf_init_thread_pool(struct ioperf_bdev *ioperf)
@@ -508,26 +487,6 @@ bdev_ioperf_destruct(void *ctx)
     g_ioperf_bdev = NULL;
 
     return 0;
-}
-
-static bool
-bdev_ioperf_abort_io(struct ioperf_io_channel *ch, struct spdk_bdev_io *bio_to_abort)
-{
-    struct ioperf_io_ctx *io_ctx;
-    struct spdk_bdev_io *bdev_io;
-
-    TAILQ_FOREACH(io_ctx, &ch->wait_queue, link) {
-        bdev_io = spdk_bdev_io_from_ctx(io_ctx);
-
-        if (bdev_io == bio_to_abort) {
-            TAILQ_REMOVE(&ch->wait_queue, io_ctx, link);
-            ch->queued_io--;
-            spdk_bdev_io_complete(bio_to_abort, SPDK_BDEV_IO_STATUS_ABORTED);
-            return true;
-        }
-    }
-
-    return false;
 }
 
 static void
