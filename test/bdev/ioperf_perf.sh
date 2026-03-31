@@ -52,11 +52,11 @@ while getopts "n:s:b:t:r:w:o:q:T:W:h" opt; do
     esac
 done
 
-# Function to send RPC
+# Function to send RPC using rpc.py
 rpc() {
     local cmd="$1"
     if [ -S "$RPC_SOCKET" ]; then
-        echo "$cmd" | nc -U "$RPC_SOCKET" || true
+        python3 scripts/rpc.py -s "$RPC_SOCKET" "$cmd" || true
     else
         echo "Error: RPC socket $RPC_SOCKET not found"
         exit 1
