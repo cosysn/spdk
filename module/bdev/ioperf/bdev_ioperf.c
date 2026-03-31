@@ -11,6 +11,7 @@
 #include "spdk/json.h"
 #include "spdk/string.h"
 #include "spdk/likely.h"
+#include "spdk/barrier.h"
 
 #include "spdk/bdev_module.h"
 #include "spdk/log.h"
@@ -193,7 +194,7 @@ ioperf_reg_access(void)
     }
 }
 
-/* Simulate memory barrier access */
+/* Simulate memory barrier access using SPDK portable barrier API */
 static void
 ioperf_mem_barrier(void)
 {
@@ -201,7 +202,7 @@ ioperf_mem_barrier(void)
 
     /* 8 memory barriers */
     for (i = 0; i < 8; i++) {
-        __asm__ volatile("mfence" ::: "memory");
+        spdk_mb();
     }
 }
 
