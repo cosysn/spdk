@@ -34,7 +34,6 @@ static int bdev_ioperf_config_json(struct spdk_json_write_ctx *w);
 static void fill_all_fields(struct ioperf_io_ctx *ctx);
 static void ioperf_process_io_on_target(void *ctx);
 static void ioperf_complete_io(void *ctx);
-static int ioperf_delay_poll(void *ctx);
 
 static int
 bdev_ioperf_get_ctx_size(void)
@@ -95,9 +94,6 @@ ioperf_bdev_create_cb(void *io_device, void *ctx_buf)
     ch->last_time = spdk_get_ticks();
     ch->token_bucket = 0;
     ch->thread_id = spdk_thread_get_id(spdk_get_thread());
-
-    /* Register poller to check delayed IO queue */
-    ch->delay_poller = spdk_poller_register(ioperf_delay_poll, ch, 100);  /* poll every 100us */
 
     return 0;
 }
@@ -194,63 +190,35 @@ ioperf_mem_barrier(void)
     }
 }
 
-/* Delayed IO processing - runs after 100us delay */
-static void
-ioperf_delayed_process(void *ctx)
-{
-    struct ioperf_io_ctx *io_ctx = (struct ioperf_io_ctx *)ctx;
-    struct spdk_bdev_io *bdev_io = io_ctx->bio;
-    struct ioperf_bdev *ioperf = (struct ioperf_bdev *)bdev_io->bdev->ctxt;
-
-    /* 4 hardware register accesses with ~500ns delay each */
-    ioperf_reg_access();
-
-    /* 8 memory barriers */
-    ioperf_mem_barrier();
-
-    /* Fill hash map values */
-    io_ctx->hash_map_value_1 = (int)(bdev_io->u.bdev.offset_blocks % ioperf->hash_map_1.size);
-    io_ctx->hash_map_value_2 = (int)((bdev_io->u.bdev.offset_blocks / 1000) % ioperf->hash_map_2.size);
-
-    /* Fill all 100+ fields */
-    fill_all_fields(io_ctx);
-
-    /* Send completion back to source thread */
-    spdk_thread_send_msg(io_ctx->src_thread, ioperf_complete_io, io_ctx);
-}
-
-/* Check and process delayed IOs */
-static int
-ioperf_delay_poll(void *ctx)
-{
-    struct ioperf_io_channel *ch = (struct ioperf_io_channel *)ctx;
-    struct ioperf_io_ctx *io_ctx, *tmp;
-    uint64_t now = spdk_get_ticks();
-    uint64_t delay_ticks = spdk_get_ticks_hz() / 10;  /* 100us */
-
-    TAILQ_FOREACH_SAFE(io_ctx, &ch->wait_queue, link, tmp) {
-        if (now - io_ctx->queued_io >= delay_ticks) {
-            /* Remove from queue */
-            TAILQ_REMOVE(&ch->wait_queue, io_ctx, link);
-            /* Process after delay */
-            spdk_thread_send_msg(spdk_get_thread(), ioperf_delayed_process, io_ctx);
-        }
-    }
-
-    return 0;
-}
-
-/* Process I/O on target thread - add to queue for async delay */
+/* Process I/O on target thread - check wait queue then add new IO */
 static void
 ioperf_process_io_on_target(void *ctx)
 {
     struct ioperf_io_ctx *io_ctx = (struct ioperf_io_ctx *)ctx;
     struct ioperf_io_channel *ch;
+    struct ioperf_io_ctx *wait_ctx, *tmp;
+    uint64_t now = spdk_get_ticks();
+    uint64_t delay_ticks = spdk_get_ticks_hz() / 10;  /* 100us */
 
     /* Get IO channel */
     ch = spdk_io_channel_get_ctx(spdk_bdev_io_get_io_channel(io_ctx->bio));
 
-    /* Add to wait queue with timestamp */
+    /* Check wait queue - process any IO that has been waiting >100us */
+    TAILQ_FOREACH_SAFE(wait_ctx, &ch->wait_queue, link, tmp) {
+        if (now - wait_ctx->queued_io >= delay_ticks) {
+            /* Has waited >100us, process and complete */
+            TAILQ_REMOVE(&ch->wait_queue, wait_ctx, link);
+            fill_all_fields(wait_ctx);
+            spdk_bdev_io_complete(wait_ctx->bio, SPDK_BDEV_IO_STATUS_SUCCESS);
+            /* Update stats */
+            struct ioperf_bdev *ioperf = (struct ioperf_bdev *)wait_ctx->bio->bdev->ctxt;
+            ioperf->total_io++;
+            ioperf->total_bytes += wait_ctx->bio->u.bdev.num_blocks * wait_ctx->bio->bdev->blocklen;
+            spdk_mempool_put(ioperf->io_pool, wait_ctx);
+        }
+    }
+
+    /* Add new IO to wait queue */
     io_ctx->queued_io = spdk_get_ticks();
     TAILQ_INSERT_TAIL(&ch->wait_queue, io_ctx, link);
 }
