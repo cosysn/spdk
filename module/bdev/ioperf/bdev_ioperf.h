@@ -86,7 +86,7 @@ struct ioperf_io_channel {
     uint64_t                        last_time;
     uint64_t                        token_bucket;
     uint32_t                        thread_id;
-    struct spdk_poller             *delay_poller;
+    struct spdk_poller             *wait_poller;
 };
 
 /* IO request structure - allocated from memory pool */

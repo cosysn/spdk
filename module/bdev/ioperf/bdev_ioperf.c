@@ -34,6 +34,7 @@ static int bdev_ioperf_config_json(struct spdk_json_write_ctx *w);
 static void fill_all_fields(struct ioperf_io_ctx *ctx);
 static void ioperf_process_io_on_target(void *ctx);
 static void ioperf_complete_io(void *ctx);
+static int ioperf_wait_poll(void *ctx);
 
 static int
 bdev_ioperf_get_ctx_size(void)
@@ -94,6 +95,9 @@ ioperf_bdev_create_cb(void *io_device, void *ctx_buf)
     ch->last_time = spdk_get_ticks();
     ch->token_bucket = 0;
     ch->thread_id = spdk_thread_get_id(spdk_get_thread());
+
+    /* Register poller to check wait queue every poll cycle */
+    ch->wait_poller = spdk_poller_register(ioperf_wait_poll, ch, 0);
 
     return 0;
 }
@@ -188,6 +192,30 @@ ioperf_mem_barrier(void)
     for (i = 0; i < 8; i++) {
         spdk_mb();
     }
+}
+
+/* Wait queue poller - check and complete IO waiting >100us */
+static int
+ioperf_wait_poll(void *ctx)
+{
+    struct ioperf_io_channel *ch = (struct ioperf_io_channel *)ctx;
+    struct ioperf_io_ctx *wait_ctx, *tmp;
+    uint64_t now = spdk_get_ticks();
+    uint64_t delay_ticks = spdk_get_ticks_hz() / 10;  /* 100us */
+
+    TAILQ_FOREACH_SAFE(wait_ctx, &ch->wait_queue, link, tmp) {
+        if (now - wait_ctx->queued_io >= delay_ticks) {
+            TAILQ_REMOVE(&ch->wait_queue, wait_ctx, link);
+            fill_all_fields(wait_ctx);
+            spdk_bdev_io_complete(wait_ctx->bio, SPDK_BDEV_IO_STATUS_SUCCESS);
+            struct ioperf_bdev *ioperf = (struct ioperf_bdev *)wait_ctx->bio->bdev->ctxt;
+            ioperf->total_io++;
+            ioperf->total_bytes += wait_ctx->bio->u.bdev.num_blocks * wait_ctx->bio->bdev->blocklen;
+            spdk_mempool_put(ioperf->io_pool, wait_ctx);
+        }
+    }
+
+    return 0;
 }
 
 /* Process I/O on target thread - check wait queue then add new IO */
