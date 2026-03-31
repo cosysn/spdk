@@ -29,6 +29,7 @@ static struct ioperf_bdev *g_ioperf_bdev = NULL;
 static int bdev_ioperf_initialize(void);
 static void bdev_ioperf_finish(void);
 static int bdev_ioperf_config_json(struct spdk_json_write_ctx *w);
+static void bdev_ioperf_write_config_json(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w);
 
 /* Forward declarations */
 static void fill_all_fields(struct ioperf_io_ctx *ctx);
@@ -617,6 +618,7 @@ static const struct spdk_bdev_fn_table ioperf_fn_table = {
     .submit_request = bdev_ioperf_submit_request,
     .io_type_supported = bdev_ioperf_io_type_supported,
     .get_io_channel = bdev_ioperf_get_io_channel,
+    .write_config_json = bdev_ioperf_write_config_json,
 };
 
 static void
@@ -637,7 +639,6 @@ bdev_ioperf_write_config_json(struct spdk_bdev *bdev, struct spdk_json_write_ctx
     spdk_json_write_named_uint64(w, "read_latency_us", ioperf->read_latency_us);
     spdk_json_write_named_uint64(w, "write_latency_us", ioperf->write_latency_us);
     spdk_json_write_named_bool(w, "enable_validation", ioperf->enable_validation);
-    spdk_json_write_named_uuid(w, "uuid", &bdev->uuid);
     spdk_json_write_object_end(w);
 
     spdk_json_write_object_end(w);
@@ -648,11 +649,9 @@ bdev_ioperf_config_json(struct spdk_json_write_ctx *w)
 {
     struct ioperf_bdev *bdev;
 
-    spdk_json_write_batch_begin(w);
     TAILQ_FOREACH(bdev, &g_ioperf_bdev_head, tailq) {
         bdev_ioperf_write_config_json(&bdev->bdev, w);
     }
-    spdk_json_write_batch_end(w);
 
     return 0;
 }
@@ -729,9 +728,8 @@ bdev_ioperf_create(struct spdk_bdev **bdev, const struct ioperf_bdev_opts *opts)
         return rc;
     }
 
-    if (!spdk_uuid_is_null(&opts->uuid)) {
-        spdk_uuid_copy(&ioperf->bdev.uuid, &opts->uuid);
-    }
+    /* Generate UUID */
+    spdk_uuid_generate(&ioperf->bdev.uuid);
 
     ioperf->bdev.ctxt = ioperf;
     ioperf->bdev.fn_table = &ioperf_fn_table;
