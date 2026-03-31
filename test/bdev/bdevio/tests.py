@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
-#  SPDX-License-Identifier: BSD-3-Clause
-#  Copyright (C) 2019 Intel Corporation
-#  All rights reserved.
-#
-
-import argparse
 import logging
-import shlex
+import argparse
 import sys
+import shlex
 
 try:
-    from spdk.rpc.client import JSONRPCClient, JSONRPCException
-    from spdk.rpc.cmd_parser import print_dict
+    from rpc.client import print_dict, JSONRPCException
+    import rpc
 except ImportError:
-    print("SPDK RPC library missing. Please add spdk/python directory to PYTHONPATH:")
-    print("'export PYTHONPATH=$PYTHONPATH:spdk/python'")
+    print("SPDK RPC library missing. Please add spdk/scripts/ directory to PYTHONPATH:")
+    print("'export PYTHONPATH=$PYTHONPATH:./spdk/scripts/'")
     exit(1)
+
+try:
+    from shlex import quote
+except ImportError:
+    from pipes import quote
+
+
+def print_array(a):
+    print(" ".join((quote(v) for v in a)))
 
 
 def perform_tests_func(client, name=None):
@@ -35,7 +39,7 @@ def perform_tests_func(client, name=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description='SPDK RPC command line interface. NOTE: spdk/python is expected in PYTHONPATH')
+        description='SPDK RPC command line interface. NOTE: spdk/scripts/ is expected in PYTHONPATH')
     parser.add_argument('-s', dest='server_addr',
                         help='RPC domain socket path or IP address', default='/var/tmp/spdk.sock')
     parser.add_argument('-p', dest='port',
@@ -73,7 +77,7 @@ if __name__ == "__main__":
             call_rpc_func(args)
 
     args = parser.parse_args()
-    args.client = JSONRPCClient(args.server_addr, args.port, args.timeout, log_level=getattr(logging, args.verbose.upper()))
+    args.client = rpc.client.JSONRPCClient(args.server_addr, args.port, args.timeout, log_level=getattr(logging, args.verbose.upper()))
     if hasattr(args, 'func'):
         call_rpc_func(args)
     elif sys.stdin.isatty():
