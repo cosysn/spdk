@@ -927,7 +927,10 @@ bdev_ioperf_create(struct spdk_bdev **bdev, const struct ioperf_bdev_opts *opts)
         return rc;
     }
 
-    /* Thread pool collection removed - now uses per-thread ctx collected at init */
+    /* Collect threads for IO routing at bdev create time */
+    if (g_ioperf_thread_mgr.thread_count == 0) {
+        spdk_for_each_thread(ioperf_collect_thread, &g_ioperf_thread_mgr, NULL);
+    }
 
     rc = spdk_bdev_register(&ioperf->bdev);
     if (rc) {
@@ -992,13 +995,10 @@ bdev_ioperf_initialize(void)
     spdk_io_device_register(&g_ioperf_bdev_head, ioperf_bdev_create_cb, ioperf_bdev_destroy_cb,
                             sizeof(struct ioperf_io_channel), "ioperf_bdev");
 
-    /* Initialize thread manager (per-thread ctx collection disabled for now) */
+    /* Initialize thread manager */
     g_ioperf_thread_mgr.ctxs = NULL;
     g_ioperf_thread_mgr.thread_count = 0;
     __atomic_store_n(&g_ioperf_thread_mgr.next_id, 0, __ATOMIC_RELAXED);
-
-    /* Thread collection deferred - uncomment after debugging */
-    /* spdk_for_each_thread(ioperf_collect_thread, &g_ioperf_thread_mgr, NULL); */
 
     /* Initialize RPC handlers */
     bdev_ioperf_rpc_init();
