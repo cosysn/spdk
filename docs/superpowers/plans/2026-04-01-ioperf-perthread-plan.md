@@ -39,7 +39,7 @@ struct ioperf_thread_mgr {
 extern struct ioperf_thread_mgr g_ioperf_thread_mgr;
 ```
 
-- [ ] **Step 2: Add ioperf_thread_ctx structure**
+- [ ] **Step 2: Add ioperf_thread_ctx structure (with rate_limit_queue)**
 
 ```c
 // After ioperf_io_channel definition (around line 104):
@@ -47,9 +47,12 @@ extern struct ioperf_thread_mgr g_ioperf_thread_mgr;
 struct ioperf_thread_ctx {
     uint32_t                    thread_id;           /* Sequential ID (0-based) */
     struct spdk_thread         *thread;             /* SPDK thread handle */
-    TAILQ_HEAD(, ioperf_io_ctx) wait_queue;       /* IO wait queue */
+    TAILQ_HEAD(, ioperf_io_ctx) wait_queue;       /* IO wait queue (100us delay) */
+    TAILQ_HEAD(, ioperf_io_ctx) rate_limit_queue; /* IO rate limit queue */
     struct spdk_poller         *poller;             /* Wait queue poller */
     uint64_t                   delay_ticks;        /* 100us delay in ticks */
+    uint64_t                   last_time;           /* Last rate limit check time */
+    uint64_t                   token_bucket;       /* Rate limit token bucket */
     TAILQ_ENTRY(ioperf_thread_ctx) link;
 };
 ```
@@ -118,6 +121,9 @@ ioperf_collect_thread(void *ctx)
     thread_ctx->thread_id = atomic_fetch_add(&mgr->next_id, 1);
     thread_ctx->thread = thread;
     TAILQ_INIT(&thread_ctx->wait_queue);
+    TAILQ_INIT(&thread_ctx->rate_limit_queue);
+    thread_ctx->last_time = 0;
+    thread_ctx->token_bucket = 0;
 
     /* Register poller */
     thread_ctx->poller = spdk_poller_register(ioperf_thread_poll, thread_ctx, 0);
@@ -182,7 +188,7 @@ Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>"
 static int ioperf_thread_poll(void *ctx);
 ```
 
-- [ ] **Step 2: Implement ioperf_thread_poll function**
+- [ ] **Step 2: Implement ioperf_thread_poll function (with rate_limit_queue processing)**
 
 ```c
 static int
@@ -192,6 +198,7 @@ ioperf_thread_poll(void *ctx)
     struct ioperf_io_ctx *io_ctx, *tmp;
     uint64_t now = spdk_get_ticks();
 
+    /* Process wait queue - complete IO that has waited >100us */
     TAILQ_FOREACH_SAFE(io_ctx, &thread_ctx->wait_queue, link, tmp) {
         if (now - io_ctx->queued_io >= thread_ctx->delay_ticks) {
             TAILQ_REMOVE(&thread_ctx->wait_queue, io_ctx, link);
@@ -210,6 +217,25 @@ ioperf_thread_poll(void *ctx)
 
             /* Return io_ctx to pool */
             spdk_mempool_put(ioperf->io_pool, io_ctx);
+        }
+    }
+
+    /* Process rate limit queue - retry IO that is now within rate limit */
+    struct ioperf_io_ctx *rl_ctx, *rl_tmp;
+    TAILQ_FOREACH_SAFE(rl_ctx, &thread_ctx->rate_limit_queue, link, rl_tmp) {
+        struct ioperf_bdev *ioperf = (struct ioperf_bdev *)rl_ctx->bio->bdev->ctxt;
+        if (rate_limit_check(thread_ctx, ioperf, rl_ctx)) {
+            TAILQ_REMOVE(&thread_ctx->rate_limit_queue, rl_ctx, link);
+            /* Retry - send to target thread for processing */
+            uint32_t target_thread_idx = ioperf_hash_lba(rl_ctx->bio->u.bdev.offset_blocks, ioperf->num_threads);
+            struct spdk_thread *target_thread;
+            if (ioperf->thread_pool && ioperf->thread_pool_size > 0) {
+                target_thread = ioperf->thread_pool[target_thread_idx % ioperf->thread_pool_size];
+            } else {
+                target_thread = rl_ctx->src_thread;
+            }
+            rl_ctx->target_thread = target_thread_idx;
+            spdk_thread_send_msg(target_thread, ioperf_process_io_on_target, rl_ctx);
         }
     }
 
@@ -311,6 +337,15 @@ bdev_ioperf_finish(void)
         while (!TAILQ_EMPTY(&thread_ctx->wait_queue)) {
             io_ctx = TAILQ_FIRST(&thread_ctx->wait_queue);
             TAILQ_REMOVE(&thread_ctx->wait_queue, io_ctx, link);
+            spdk_bdev_io_complete(io_ctx->bio, SPDK_BDEV_IO_STATUS_ABORTED);
+            struct ioperf_bdev *ioperf = (struct ioperf_bdev *)io_ctx->bio->bdev->ctxt;
+            spdk_mempool_put(ioperf->io_pool, io_ctx);
+        }
+
+        /* Drain rate_limit_queue */
+        while (!TAILQ_EMPTY(&thread_ctx->rate_limit_queue)) {
+            io_ctx = TAILQ_FIRST(&thread_ctx->rate_limit_queue);
+            TAILQ_REMOVE(&thread_ctx->rate_limit_queue, io_ctx, link);
             spdk_bdev_io_complete(io_ctx->bio, SPDK_BDEV_IO_STATUS_ABORTED);
             struct ioperf_bdev *ioperf = (struct ioperf_bdev *)io_ctx->bio->bdev->ctxt;
             spdk_mempool_put(ioperf->io_pool, io_ctx);
