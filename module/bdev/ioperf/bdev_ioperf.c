@@ -392,24 +392,36 @@ static void
 ioperf_process_io_on_target(void *ctx)
 {
     struct ioperf_io_ctx *io_ctx = (struct ioperf_io_ctx *)ctx;
-    struct spdk_io_channel *target_ch;
-    struct ioperf_io_channel *ch;
+    struct ioperf_thread_ctx *thread_ctx = NULL;
     struct ioperf_io_ctx *wait_ctx, *tmp;
+    struct spdk_thread *thread = spdk_get_thread();
+    uint32_t i;
     uint64_t now = spdk_get_ticks();
-    uint64_t delay_ticks = spdk_get_ticks_hz() / 10;  /* 100us */
 
-    /* Get target thread's IO channel */
-    target_ch = spdk_get_io_channel(&g_ioperf_bdev_head);
-    ch = spdk_io_channel_get_ctx(target_ch);
+    /* Find current thread's context by searching array */
+    for (i = 0; i < g_ioperf_thread_mgr.thread_count; i++) {
+        if (g_ioperf_thread_mgr.ctxs[i]->thread == thread) {
+            thread_ctx = g_ioperf_thread_mgr.ctxs[i];
+            break;
+        }
+    }
 
-    /* Check wait queue - process any IO that has been waiting >100us */
-    TAILQ_FOREACH_SAFE(wait_ctx, &ch->wait_queue, link, tmp) {
-        if (now - wait_ctx->queued_io >= delay_ticks) {
-            /* Has waited >100us, process and complete */
-            TAILQ_REMOVE(&ch->wait_queue, wait_ctx, link);
+    if (!thread_ctx) {
+        /* Should not happen, but handle gracefully */
+        spdk_bdev_io_complete(io_ctx->bio, SPDK_BDEV_IO_STATUS_FAILED);
+        struct ioperf_bdev *ioperf = (struct ioperf_bdev *)io_ctx->bio->bdev->ctxt;
+        spdk_mempool_put(ioperf->io_pool, io_ctx);
+        return;
+    }
+
+    /* Check wait queue - process IO that has been waiting >100us */
+    TAILQ_FOREACH_SAFE(wait_ctx, &thread_ctx->wait_queue, link, tmp) {
+        if (now - wait_ctx->queued_io >= thread_ctx->delay_ticks) {
+            TAILQ_REMOVE(&thread_ctx->wait_queue, wait_ctx, link);
+            ioperf_reg_access();
+            ioperf_mem_barrier();
             fill_all_fields(wait_ctx);
             spdk_bdev_io_complete(wait_ctx->bio, SPDK_BDEV_IO_STATUS_SUCCESS);
-            /* Update stats */
             struct ioperf_bdev *ioperf = (struct ioperf_bdev *)wait_ctx->bio->bdev->ctxt;
             ioperf->total_io++;
             ioperf->total_bytes += wait_ctx->bio->u.bdev.num_blocks * wait_ctx->bio->bdev->blocklen;
@@ -419,7 +431,7 @@ ioperf_process_io_on_target(void *ctx)
 
     /* Add new IO to wait queue */
     io_ctx->queued_io = spdk_get_ticks();
-    TAILQ_INSERT_TAIL(&ch->wait_queue, io_ctx, link);
+    TAILQ_INSERT_TAIL(&thread_ctx->wait_queue, io_ctx, link);
 }
 
 static void
