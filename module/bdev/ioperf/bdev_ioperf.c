@@ -1003,5 +1003,44 @@ bdev_ioperf_initialize(void)
 static void
 bdev_ioperf_finish(void)
 {
-    /* Nothing to clean up */
+    if (!g_ioperf_thread_mgr.ctxs) {
+        return;
+    }
+
+    /* Drain wait_queues and cleanup each thread */
+    for (uint32_t i = 0; i < g_ioperf_thread_mgr.thread_count; i++) {
+        struct ioperf_thread_ctx *thread_ctx = g_ioperf_thread_mgr.ctxs[i];
+        struct ioperf_io_ctx *io_ctx;
+
+        /* Drain wait_queue */
+        while (!TAILQ_EMPTY(&thread_ctx->wait_queue)) {
+            io_ctx = TAILQ_FIRST(&thread_ctx->wait_queue);
+            TAILQ_REMOVE(&thread_ctx->wait_queue, io_ctx, link);
+            spdk_bdev_io_complete(io_ctx->bio, SPDK_BDEV_IO_STATUS_ABORTED);
+            struct ioperf_bdev *ioperf = (struct ioperf_bdev *)io_ctx->bio->bdev->ctxt;
+            spdk_mempool_put(ioperf->io_pool, io_ctx);
+        }
+
+        /* Drain rate_limit_queue */
+        while (!TAILQ_EMPTY(&thread_ctx->rate_limit_queue)) {
+            io_ctx = TAILQ_FIRST(&thread_ctx->rate_limit_queue);
+            TAILQ_REMOVE(&thread_ctx->rate_limit_queue, io_ctx, link);
+            spdk_bdev_io_complete(io_ctx->bio, SPDK_BDEV_IO_STATUS_ABORTED);
+            struct ioperf_bdev *ioperf = (struct ioperf_bdev *)io_ctx->bio->bdev->ctxt;
+            spdk_mempool_put(ioperf->io_pool, io_ctx);
+        }
+
+        /* Unregister poller */
+        if (thread_ctx->poller) {
+            spdk_poller_unregister(&thread_ctx->poller);
+        }
+
+        /* Free thread context */
+        free(thread_ctx);
+    }
+
+    /* Free array and reset manager */
+    free(g_ioperf_thread_mgr.ctxs);
+    g_ioperf_thread_mgr.ctxs = NULL;
+    g_ioperf_thread_mgr.thread_count = 0;
 }
