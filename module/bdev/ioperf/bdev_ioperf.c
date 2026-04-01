@@ -21,8 +21,15 @@
 /* RPC handlers are in bdev_ioperf_rpc.c */
 extern int bdev_ioperf_rpc_init(void);
 
-/* Global ioperf bdev list - defined in bdev_ioperf.c */
-extern struct ioperf_bdev *g_ioperf_bdev;
+/* Global ioperf bdev list */
+TAILQ_HEAD(, ioperf_bdev) g_ioperf_bdev_head;
+struct ioperf_bdev *g_ioperf_bdev;
+struct ioperf_thread_mgr g_ioperf_thread_mgr;
+
+/* Getter function for bdev_ioperf_rpc.c */
+struct ioperf_bdev *ioperf_get_bdev_head(void) {
+    return &g_ioperf_bdev_head;
+}
 
 #define MAX_QUEUED_IO 1024
 
@@ -36,6 +43,91 @@ static void fill_all_fields(struct ioperf_io_ctx *ctx);
 static bool rate_limit_check(struct ioperf_io_channel *ch, struct ioperf_bdev *ioperf, struct ioperf_io_ctx *io_ctx);
 static void ioperf_process_io_on_target(void *ctx);
 static int ioperf_wait_poll(void *ctx);
+static void ioperf_register_thread(void *ctx);
+static int ioperf_thread_poll(void *ctx);
+
+/* Collect SPDK threads for IO routing */
+static void
+ioperf_register_thread(void *ctx)
+{
+    struct ioperf_thread_mgr *mgr = ctx;
+    uint32_t count = __atomic_fetch_add(&mgr->thread_count, 1, __ATOMIC_RELAXED);
+    if (count < 128) {
+        mgr->threads[count] = spdk_get_thread();
+    }
+}
+
+/* Thread collection for per-thread context management */
+void
+ioperf_collect_thread(void *ctx)
+{
+    struct ioperf_thread_mgr *mgr = ctx;
+    struct spdk_thread *thread = spdk_get_thread();
+    struct ioperf_thread_ctx *thread_ctx;
+    uint32_t i;
+
+    /* Check if thread already has context by searching existing contexts */
+    for (i = 0; i < mgr->thread_count; i++) {
+        if (mgr->ctxs[i]->thread == thread) {
+            return;
+        }
+    }
+
+    /* Allocate thread context */
+    thread_ctx = calloc(1, sizeof(*thread_ctx));
+    if (!thread_ctx) {
+        SPDK_ERRLOG("Failed to allocate thread context\n");
+        return;
+    }
+
+    /* Assign sequential thread_id */
+    thread_ctx->thread_id = __atomic_fetch_add(&mgr->next_id, 1, __ATOMIC_RELAXED);
+    thread_ctx->thread = thread;
+    TAILQ_INIT(&thread_ctx->wait_queue);
+    TAILQ_INIT(&thread_ctx->rate_limit_queue);
+    thread_ctx->last_time = 0;
+    thread_ctx->token_bucket = 0;
+
+    /* Register poller */
+    thread_ctx->poller = spdk_poller_register(ioperf_thread_poll, thread_ctx, 0);
+
+    /* Calculate delay_ticks for 100us */
+    thread_ctx->delay_ticks = spdk_get_ticks_hz() / 10000;
+
+    /* Add to array */
+    void *new_ptr = realloc(mgr->ctxs, (mgr->thread_count + 1) * sizeof(*mgr->ctxs));
+    if (!new_ptr) {
+        SPDK_ERRLOG("Failed to expand thread context array\n");
+        spdk_poller_unregister(&thread_ctx->poller);
+        free(thread_ctx);
+        return;
+    }
+    mgr->ctxs = new_ptr;
+    mgr->ctxs[mgr->thread_count++] = thread_ctx;
+}
+
+/* Get thread ID for current thread */
+uint32_t
+ioperf_get_thread_id(void)
+{
+    struct spdk_thread *thread = spdk_get_thread();
+    uint32_t i;
+
+    /* Search through registered thread contexts */
+    for (i = 0; i < g_ioperf_thread_mgr.thread_count; i++) {
+        if (g_ioperf_thread_mgr.ctxs[i]->thread == thread) {
+            return g_ioperf_thread_mgr.ctxs[i]->thread_id;
+        }
+    }
+    return UINT32_MAX;
+}
+
+/* Stub for per-thread poller - to be implemented in Task 3 */
+static int
+ioperf_thread_poll(void *ctx)
+{
+    return 0;
+}
 
 static int
 bdev_ioperf_get_ctx_size(void)
@@ -567,14 +659,17 @@ bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bde
         return;
     }
 
-    /* Calculate target thread using LBA hash */
-    uint32_t target_thread_idx = ioperf_hash_lba(lba, ioperf->num_threads);
+    /* Calculate target thread using LBA hash - use per-bdev thread pool */
+    uint32_t thread_count = ioperf->thread_pool_size;
+    uint32_t target_thread_idx;
 
-    /* Get target thread */
-    if (ioperf->thread_pool && ioperf->thread_pool_size > 0) {
-        target_thread = ioperf->thread_pool[target_thread_idx % ioperf->thread_pool_size];
+    if (thread_count > 0) {
+        target_thread_idx = ioperf_hash_lba(lba, thread_count);
+        target_thread = ioperf->thread_pool[target_thread_idx % thread_count];
     } else {
+        /* No threads registered yet, process on current thread */
         target_thread = current_thread;
+        target_thread_idx = 0;
     }
 
     io_ctx->target_thread = target_thread_idx;
@@ -750,6 +845,14 @@ bdev_ioperf_create(struct spdk_bdev **bdev, const struct ioperf_bdev_opts *opts)
         return rc;
     }
 
+    /* Collect thread pool if not already done */
+    if (g_ioperf_thread_mgr.thread_count == 0) {
+        g_ioperf_thread_mgr.threads = calloc(128, sizeof(struct spdk_thread *));
+        if (g_ioperf_thread_mgr.threads) {
+            spdk_for_each_thread(ioperf_register_thread, &g_ioperf_thread_mgr, NULL);
+        }
+    }
+
     rc = spdk_bdev_register(&ioperf->bdev);
     if (rc) {
         ioperf_destroy_thread_pool(ioperf);
@@ -813,8 +916,14 @@ bdev_ioperf_initialize(void)
     spdk_io_device_register(&g_ioperf_bdev_head, ioperf_bdev_create_cb, ioperf_bdev_destroy_cb,
                             sizeof(struct ioperf_io_channel), "ioperf_bdev");
 
+    /* Initialize thread pool for IO routing - collected when bdev is created */
+    g_ioperf_thread_mgr.thread_count = 0;
+    g_ioperf_thread_mgr.threads = NULL;
+
     /* Initialize RPC handlers */
     bdev_ioperf_rpc_init();
+
+    SPDK_NOTICELOG("ioperf: initialized with %u threads\n", g_ioperf_thread_mgr.thread_count);
 
     return 0;
 }

@@ -51,6 +51,7 @@ struct ioperf_bdev *ioperf_get_bdev_head(void);
 /* Global thread manager */
 struct ioperf_thread_mgr {
     struct ioperf_thread_ctx **ctxs;   /* Array of thread contexts */
+    struct spdk_thread        **threads;  /* Array of SPDK thread handles */
     uint32_t                thread_count;
     _Atomic uint32_t        next_id;
 };
