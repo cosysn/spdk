@@ -27,8 +27,10 @@ struct ioperf_bdev *g_ioperf_bdev;
 struct ioperf_thread_mgr g_ioperf_thread_mgr;
 
 /* Getter function for bdev_ioperf_rpc.c */
-struct ioperf_bdev *ioperf_get_bdev_head(void) {
-    return &g_ioperf_bdev_head;
+struct ioperf_bdev *
+ioperf_get_bdev_head(void)
+{
+    return TAILQ_FIRST(&g_ioperf_bdev_head);
 }
 
 #define MAX_QUEUED_IO 1024
@@ -925,13 +927,7 @@ bdev_ioperf_create(struct spdk_bdev **bdev, const struct ioperf_bdev_opts *opts)
         return rc;
     }
 
-    /* Collect thread pool if not already done */
-    if (g_ioperf_thread_mgr.thread_count == 0) {
-        g_ioperf_thread_mgr.threads = calloc(128, sizeof(struct spdk_thread *));
-        if (g_ioperf_thread_mgr.threads) {
-            spdk_for_each_thread(ioperf_register_thread, &g_ioperf_thread_mgr, NULL);
-        }
-    }
+    /* Thread pool collection removed - now uses per-thread ctx collected at init */
 
     rc = spdk_bdev_register(&ioperf->bdev);
     if (rc) {
@@ -996,18 +992,18 @@ bdev_ioperf_initialize(void)
     spdk_io_device_register(&g_ioperf_bdev_head, ioperf_bdev_create_cb, ioperf_bdev_destroy_cb,
                             sizeof(struct ioperf_io_channel), "ioperf_bdev");
 
-    /* Initialize thread manager */
+    /* Initialize thread manager (per-thread ctx collection disabled for now) */
     g_ioperf_thread_mgr.ctxs = NULL;
     g_ioperf_thread_mgr.thread_count = 0;
     __atomic_store_n(&g_ioperf_thread_mgr.next_id, 0, __ATOMIC_RELAXED);
 
-    /* Collect existing threads and assign thread_ids */
-    spdk_for_each_thread(ioperf_collect_thread, &g_ioperf_thread_mgr, NULL);
+    /* Thread collection deferred - uncomment after debugging */
+    /* spdk_for_each_thread(ioperf_collect_thread, &g_ioperf_thread_mgr, NULL); */
 
     /* Initialize RPC handlers */
     bdev_ioperf_rpc_init();
 
-    SPDK_NOTICELOG("ioperf: initialized with %u threads\n", g_ioperf_thread_mgr.thread_count);
+    SPDK_NOTICELOG("ioperf: initialized\n");
 
     return 0;
 }
