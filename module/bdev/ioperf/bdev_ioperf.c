@@ -980,13 +980,17 @@ bdev_ioperf_resize(const char *bdev_name, const uint64_t new_size_in_mb)
 static int
 bdev_ioperf_initialize(void)
 {
-    /* Register the io_device before getting io_channel */
+    /* Register the io_device */
     spdk_io_device_register(&g_ioperf_bdev_head, ioperf_bdev_create_cb, ioperf_bdev_destroy_cb,
                             sizeof(struct ioperf_io_channel), "ioperf_bdev");
 
-    /* Initialize thread pool for IO routing - collected when bdev is created */
+    /* Initialize thread manager */
+    g_ioperf_thread_mgr.ctxs = NULL;
     g_ioperf_thread_mgr.thread_count = 0;
-    g_ioperf_thread_mgr.threads = NULL;
+    __atomic_store_n(&g_ioperf_thread_mgr.next_id, 0, __ATOMIC_RELAXED);
+
+    /* Collect existing threads and assign thread_ids */
+    spdk_for_each_thread(ioperf_collect_thread, &g_ioperf_thread_mgr, NULL);
 
     /* Initialize RPC handlers */
     bdev_ioperf_rpc_init();
