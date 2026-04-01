@@ -40,7 +40,7 @@ static void bdev_ioperf_write_config_json(struct spdk_bdev *bdev, struct spdk_js
 
 /* Forward declarations */
 static void fill_all_fields(struct ioperf_io_ctx *ctx);
-static bool rate_limit_check(void *ch, struct ioperf_bdev *ioperf, struct ioperf_io_ctx *io_ctx);
+static bool rate_limit_check(void *ch, struct ioperf_bdev *ioperf, struct ioperf_io_ctx *io_ctx, bool is_thread_ctx);
 static void ioperf_process_io_on_target(void *ctx);
 static int ioperf_wait_poll(void *ctx);
 static void ioperf_register_thread(void *ctx);
@@ -159,7 +159,7 @@ ioperf_thread_poll(void *ctx)
     struct ioperf_io_ctx *rl_ctx, *rl_tmp;
     TAILQ_FOREACH_SAFE(rl_ctx, &thread_ctx->rate_limit_queue, link, rl_tmp) {
         struct ioperf_bdev *ioperf = (struct ioperf_bdev *)rl_ctx->bio->bdev->ctxt;
-        if (rate_limit_check(thread_ctx, ioperf, rl_ctx)) {
+        if (rate_limit_check(thread_ctx, ioperf, rl_ctx, true)) {
             TAILQ_REMOVE(&thread_ctx->rate_limit_queue, rl_ctx, link);
             /* Retry - send to target thread for processing */
             uint32_t target_thread_idx = ioperf_hash_lba(rl_ctx->bio->u.bdev.offset_blocks, ioperf->num_threads);
@@ -367,7 +367,7 @@ ioperf_wait_poll(void *ctx)
     struct ioperf_io_ctx *rl_ctx, *rl_tmp;
     TAILQ_FOREACH_SAFE(rl_ctx, &ch->rate_limit_queue, link, rl_tmp) {
         struct ioperf_bdev *ioperf = (struct ioperf_bdev *)rl_ctx->bio->bdev->ctxt;
-        if (rate_limit_check(ch, ioperf, rl_ctx)) {
+        if (rate_limit_check(ch, ioperf, rl_ctx, false)) {
             /* Rate limit passed, resubmit to target thread */
             TAILQ_REMOVE(&ch->rate_limit_queue, rl_ctx, link);
             uint32_t target_thread_idx = ioperf_hash_lba(rl_ctx->bio->u.bdev.offset_blocks, ioperf->num_threads);
@@ -558,19 +558,18 @@ fill_all_fields(struct ioperf_io_ctx *ctx)
 }
 
 static bool
-rate_limit_check(void *ch, struct ioperf_bdev *ioperf, struct ioperf_io_ctx *io_ctx)
+rate_limit_check(void *ch, struct ioperf_bdev *ioperf, struct ioperf_io_ctx *io_ctx, bool is_thread_ctx)
 {
     if (ioperf == NULL) {
         return true;
     }
 
-    /* Check if this is a thread context by checking for delay_ticks field */
-    struct ioperf_thread_ctx *thread_ctx = ch;
-    bool is_thread_ctx = (thread_ctx->delay_ticks > 0 || thread_ctx->delay_ticks == 0);
+    /* Use is_thread_ctx parameter to determine context type */
+    struct ioperf_thread_ctx *thread_ctx = (struct ioperf_thread_ctx *)ch;
+    struct ioperf_io_channel *channel = (struct ioperf_io_channel *)ch;
 
     uint64_t *last_time_ptr;
     uint64_t *token_bucket_ptr;
-    struct ioperf_io_channel *channel = (struct ioperf_io_channel *)ch;
 
     if (is_thread_ctx) {
         /* This is a thread context */
@@ -723,7 +722,7 @@ bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bde
 
     /* Check rate limit on source thread */
     struct ioperf_io_channel *src_ch = spdk_io_channel_get_ctx(_ch);
-    if (!rate_limit_check(src_ch, ioperf, io_ctx)) {
+    if (!rate_limit_check(src_ch, ioperf, io_ctx, false)) {
         /* Rate limited - IO added to rate_limit_queue, will retry */
         return;
     }
