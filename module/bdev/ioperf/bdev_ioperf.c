@@ -304,7 +304,10 @@ ioperf_process_io_on_target(void *ctx)
     struct ioperf_io_ctx *io_ctx = (struct ioperf_io_ctx *)ctx;
     struct ioperf_bdev *ioperf;
 
+    SPDK_ERRLOG("process_io: start, io_ctx=%p\n", io_ctx);
+
     if (!io_ctx || !io_ctx->bio) {
+        SPDK_ERRLOG("process_io: invalid context!\n");
         return;
     }
 
@@ -319,6 +322,7 @@ ioperf_process_io_on_target(void *ctx)
 
     /* Return io_ctx to pool */
     spdk_mempool_put(ioperf->io_pool, io_ctx);
+    SPDK_ERRLOG("process_io: done\n");
 }
 
 static void
@@ -556,6 +560,8 @@ bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bde
     struct ioperf_bdev *ioperf;
     struct ioperf_io_ctx *io_ctx;
 
+    SPDK_ERRLOG("submit_request: start\n");
+
     /* Get ioperf bdev from bdev context */
     ioperf = (struct ioperf_bdev *)bdev_io->bdev->ctxt;
     if (ioperf == NULL) {
@@ -564,7 +570,7 @@ bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bde
         return;
     }
 
-    SPDK_ERRLOG("submit: ioperf=%p, io_pool=%p\n", ioperf, ioperf->io_pool);
+    SPDK_ERRLOG("submit: ioperf=%p\n", ioperf);
 
     /* Allocate IO context from memory pool */
     io_ctx = spdk_mempool_get(ioperf->io_pool);
@@ -583,7 +589,9 @@ bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bde
     bdev_io->driver_ctx = io_ctx;
 
     /* Process directly */
+    SPDK_ERRLOG("submit: calling process_io\n");
     ioperf_process_io_on_target(io_ctx);
+    SPDK_ERRLOG("submit: done\n");
 }
 
 static bool
@@ -606,6 +614,8 @@ bdev_ioperf_io_type_supported(void *ctx, enum spdk_bdev_io_type io_type)
 static struct spdk_io_channel *
 bdev_ioperf_get_io_channel(void *ctx)
 {
+    /* Write to stderr directly */
+    write(2, "get_io_channel called\n", 24);
     return spdk_get_io_channel(&g_ioperf_bdev_head);
 }
 
