@@ -183,7 +183,7 @@ ioperf_thread_poll(void *ctx)
             rl_ctx->target_thread = target_thread_idx;
             rl_ctx->hash_map_value_1 = (int)(rl_ctx->bio->u.bdev.offset_blocks % ioperf->hash_map_1.size);
             rl_ctx->hash_map_value_2 = (int)((rl_ctx->bio->u.bdev.offset_blocks / 1000) % ioperf->hash_map_2.size);
-            spdk_thread_send_msg(target_thread, ioperf_process_io_on_target, rl_ctx);
+            spdk_thread_send_msg(rl_ctx->src_thread, ioperf_process_io_on_target, rl_ctx);
         }
     }
 
@@ -391,7 +391,7 @@ ioperf_wait_poll(void *ctx)
             rl_ctx->target_thread = target_thread_idx;
             rl_ctx->hash_map_value_1 = (int)(rl_ctx->bio->u.bdev.offset_blocks % ioperf->hash_map_1.size);
             rl_ctx->hash_map_value_2 = (int)((rl_ctx->bio->u.bdev.offset_blocks / 1000) % ioperf->hash_map_2.size);
-            spdk_thread_send_msg(target_thread, ioperf_process_io_on_target, rl_ctx);
+            spdk_thread_send_msg(rl_ctx->src_thread, ioperf_process_io_on_target, rl_ctx);
         }
     }
 
@@ -812,8 +812,8 @@ bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bde
     io_ctx->hash_map_value_1 = (int)(lba % ioperf->hash_map_1.size);
     io_ctx->hash_map_value_2 = (int)((lba / 1000) % ioperf->hash_map_2.size);
 
-    /* Send to target thread (including same thread) for 100us delay */
-    spdk_thread_send_msg(target_thread, ioperf_process_io_on_target, io_ctx);
+    /* Process IO in current thread - no cross-thread sending */
+    spdk_thread_send_msg(current_thread, ioperf_process_io_on_target, io_ctx);
 }
 
 static bool
