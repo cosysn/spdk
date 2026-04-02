@@ -98,6 +98,9 @@ struct ioperf_io_ctx {
     TAILQ_ENTRY(ioperf_io_ctx) link;
     struct spdk_bdev_io        *bio;
 
+    /* Channel reference for async callbacks */
+    struct ioperf_io_channel   *channel;
+
     /* Routing info */
     uint32_t                   target_thread;
     struct spdk_thread         *src_thread;

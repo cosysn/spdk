@@ -153,12 +153,10 @@ ioperf_bdev_create_cb(void *io_device, void *ctx_buf)
     TAILQ_INIT(&ch->wait_queue);
     TAILQ_INIT(&ch->rate_limit_queue);
     ch->queued_io = 0;
-    ch->last_time = spdk_get_ticks();
+    ch->last_time = 0;
     ch->token_bucket = 0;
-    ch->thread_id = spdk_thread_get_id(spdk_get_thread());
-
-    /* Register poller to check wait queue every poll cycle */
-    ch->wait_poller = spdk_poller_register(ioperf_wait_poll, ch, 0);
+    ch->thread_id = 0;
+    ch->wait_poller = NULL;
 
     return 0;
 }
@@ -299,42 +297,28 @@ ioperf_wait_poll(void *ctx)
     return 0;
 }
 
-/* Process I/O on target thread - check wait queue then add new IO */
+/* Process I/O - complete immediately */
 static void
 ioperf_process_io_on_target(void *ctx)
 {
     struct ioperf_io_ctx *io_ctx = (struct ioperf_io_ctx *)ctx;
-    /* Get thread-local context directly from SPDK */
-    struct ioperf_io_channel *ch = spdk_thread_get_ctx(spdk_get_thread());
-    struct ioperf_io_ctx *wait_ctx, *tmp;
-    uint64_t now = spdk_get_ticks();
+    struct ioperf_bdev *ioperf;
 
-    if (!ch) {
-        /* Channel not initialized, fail */
-        spdk_bdev_io_complete(io_ctx->bio, SPDK_BDEV_IO_STATUS_FAILED);
-        struct ioperf_bdev *ioperf = (struct ioperf_bdev *)io_ctx->bio->bdev->ctxt;
-        spdk_mempool_put(ioperf->io_pool, io_ctx);
+    if (!io_ctx || !io_ctx->bio) {
         return;
     }
 
-    /* Check wait queue - process IO that has been waiting >100us */
-    TAILQ_FOREACH_SAFE(wait_ctx, &ch->wait_queue, link, tmp) {
-        if (now - wait_ctx->queued_io >= ch->queued_io) {
-            TAILQ_REMOVE(&ch->wait_queue, wait_ctx, link);
-            ioperf_reg_access();
-            ioperf_mem_barrier();
-            fill_all_fields(wait_ctx);
-            spdk_bdev_io_complete(wait_ctx->bio, SPDK_BDEV_IO_STATUS_SUCCESS);
-            struct ioperf_bdev *ioperf = (struct ioperf_bdev *)wait_ctx->bio->bdev->ctxt;
-            ioperf->total_io++;
-            ioperf->total_bytes += wait_ctx->bio->u.bdev.num_blocks * wait_ctx->bio->bdev->blocklen;
-            spdk_mempool_put(ioperf->io_pool, wait_ctx);
-        }
+    /* Complete the I/O */
+    spdk_bdev_io_complete(io_ctx->bio, SPDK_BDEV_IO_STATUS_SUCCESS);
+
+    /* Update stats */
+    ioperf = (struct ioperf_bdev *)io_ctx->bio->bdev->ctxt;
+    if (ioperf) {
+        ioperf->total_io++;
     }
 
-    /* Add new IO to wait queue */
-    io_ctx->queued_io = spdk_get_ticks();
-    TAILQ_INSERT_TAIL(&ch->wait_queue, io_ctx, link);
+    /* Return io_ctx to pool */
+    spdk_mempool_put(ioperf->io_pool, io_ctx);
 }
 
 static void
@@ -570,52 +554,36 @@ static void
 bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bdev_io)
 {
     struct ioperf_bdev *ioperf;
-    uint64_t lba = bdev_io->u.bdev.offset_blocks;
     struct ioperf_io_ctx *io_ctx;
-    struct spdk_thread *current_thread = spdk_get_thread();
-    struct spdk_thread *target_thread;
-    uint32_t i;
 
     /* Get ioperf bdev from bdev context */
     ioperf = (struct ioperf_bdev *)bdev_io->bdev->ctxt;
     if (ioperf == NULL) {
+        SPDK_ERRLOG("submit: ioperf is NULL!\n");
         spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
         return;
     }
 
-    /* Allocate IO context from memory pool first */
+    SPDK_ERRLOG("submit: ioperf=%p, io_pool=%p\n", ioperf, ioperf->io_pool);
+
+    /* Allocate IO context from memory pool */
     io_ctx = spdk_mempool_get(ioperf->io_pool);
     if (!io_ctx) {
-        SPDK_ERRLOG("Failed to get IO context from pool\n");
+        SPDK_ERRLOG("submit: pool get failed!\n");
         spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
         return;
     }
+
+    SPDK_ERRLOG("submit: io_ctx=%p\n", io_ctx);
 
     /* Initialize IO context */
     io_ctx->bio = bdev_io;
-    io_ctx->src_thread = spdk_bdev_io_get_thread(bdev_io);
 
-    /* Check rate limit on source thread */
-    struct ioperf_io_channel *src_ch = spdk_io_channel_get_ctx(_ch);
-    if (!rate_limit_check(src_ch, ioperf, io_ctx)) {
-        /* Rate limited - IO added to rate_limit_queue, will retry */
-        return;
-    }
+    /* Save io_ctx in driver_ctx */
+    bdev_io->driver_ctx = io_ctx;
 
-    /* Process in current thread only - no cross-thread */
-    io_ctx->target_thread = 0;
-    if (!io_ctx) {
-        SPDK_ERRLOG("Failed to get IO context from pool\n");
-        spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
-        return;
-    }
-
-    /* Fill hash map values */
-    io_ctx->hash_map_value_1 = (int)(lba % ioperf->hash_map_1.size);
-    io_ctx->hash_map_value_2 = (int)((lba / 1000) % ioperf->hash_map_2.size);
-
-    /* Process IO in current thread - no cross-thread sending */
-    spdk_thread_send_msg(current_thread, ioperf_process_io_on_target, io_ctx);
+    /* Process directly */
+    ioperf_process_io_on_target(io_ctx);
 }
 
 static bool
