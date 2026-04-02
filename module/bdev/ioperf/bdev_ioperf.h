@@ -53,6 +53,7 @@ struct ioperf_thread_mgr {
     struct ioperf_thread_ctx **ctxs;   /* Array of thread contexts */
     struct spdk_thread        **threads;  /* Array of SPDK thread handles */
     uint32_t                thread_count;
+    uint32_t                thread_allocs;  /* Pre-allocated size */
     _Atomic uint32_t        next_id;
 };
 extern struct ioperf_thread_mgr g_ioperf_thread_mgr;
@@ -87,10 +88,6 @@ struct ioperf_bdev {
     /* Global stats */
     uint64_t                   total_io;
     uint64_t                   total_bytes;
-
-    /* Worker threads pool - reused from reactor threads */
-    struct spdk_thread        **thread_pool;
-    uint32_t                   thread_pool_size;
 
     /* Memory pool for IO requests (includes routing info + 100+ fields) */
     struct spdk_mempool        *io_pool;
