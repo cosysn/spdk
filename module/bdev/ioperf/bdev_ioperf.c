@@ -164,15 +164,7 @@ ioperf_bdev_create_cb(void *io_device, void *ctx_buf)
 static void
 ioperf_bdev_destroy_cb(void *io_device, void *ctx_buf)
 {
-    struct ioperf_io_channel *ch = ctx_buf;
-
-    /* Drain wait queue */
-    struct ioperf_io_ctx *ctx;
-    while (!TAILQ_EMPTY(&ch->wait_queue)) {
-        ctx = TAILQ_FIRST(&ch->wait_queue);
-        TAILQ_REMOVE(&ch->wait_queue, ctx, link);
-        spdk_bdev_io_complete(ctx->bio, SPDK_BDEV_IO_STATUS_ABORTED);
-    }
+    /* Nothing to cleanup */
 }
 
 static void
@@ -539,12 +531,11 @@ bdev_ioperf_destruct(void *ctx)
 
     TAILQ_REMOVE(&g_ioperf_bdev_head, bdev, tailq);
 
-    /* Cleanup thread pool */
-    ioperf_destroy_thread_pool(bdev);
-
-    /* Destroy hash maps */
-    ioperf_hash_map_destroy(&bdev->hash_map_1);
-    ioperf_hash_map_destroy(&bdev->hash_map_2);
+    /* Free io_pool */
+    if (bdev->io_pool) {
+        spdk_mempool_free(bdev->io_pool);
+        bdev->io_pool = NULL;
+    }
 
     free(bdev->bdev.name);
     free(bdev);
@@ -558,40 +549,19 @@ static void
 bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bdev_io)
 {
     struct ioperf_bdev *ioperf;
-    struct ioperf_io_ctx *io_ctx;
-
-    SPDK_ERRLOG("submit_request: start\n");
 
     /* Get ioperf bdev from bdev context */
     ioperf = (struct ioperf_bdev *)bdev_io->bdev->ctxt;
     if (ioperf == NULL) {
-        SPDK_ERRLOG("submit: ioperf is NULL!\n");
         spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
         return;
     }
 
-    SPDK_ERRLOG("submit: ioperf=%p\n", ioperf);
+    /* Complete the I/O immediately */
+    spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
 
-    /* Allocate IO context from memory pool */
-    io_ctx = spdk_mempool_get(ioperf->io_pool);
-    if (!io_ctx) {
-        SPDK_ERRLOG("submit: pool get failed!\n");
-        spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
-        return;
-    }
-
-    SPDK_ERRLOG("submit: io_ctx=%p\n", io_ctx);
-
-    /* Initialize IO context */
-    io_ctx->bio = bdev_io;
-
-    /* Save io_ctx in driver_ctx */
-    bdev_io->driver_ctx = io_ctx;
-
-    /* Process directly */
-    SPDK_ERRLOG("submit: calling process_io\n");
-    ioperf_process_io_on_target(io_ctx);
-    SPDK_ERRLOG("submit: done\n");
+    /* Update stats */
+    ioperf->total_io++;
 }
 
 static bool
@@ -614,8 +584,6 @@ bdev_ioperf_io_type_supported(void *ctx, enum spdk_bdev_io_type io_type)
 static struct spdk_io_channel *
 bdev_ioperf_get_io_channel(void *ctx)
 {
-    /* Write to stderr directly */
-    write(2, "get_io_channel called\n", 24);
     return spdk_get_io_channel(&g_ioperf_bdev_head);
 }
 
