@@ -24,7 +24,6 @@ extern int bdev_ioperf_rpc_init(void);
 /* Global ioperf bdev list */
 static TAILQ_HEAD(ioperf_bdev_head, ioperf_bdev) g_ioperf_bdev_head = TAILQ_HEAD_INITIALIZER(g_ioperf_bdev_head);
 struct ioperf_bdev *g_ioperf_bdev;
-struct ioperf_thread_mgr g_ioperf_thread_mgr;
 
 /* Getter function for bdev_ioperf_rpc.c */
 struct ioperf_bdev *
@@ -42,7 +41,7 @@ static void bdev_ioperf_write_config_json(struct spdk_bdev *bdev, struct spdk_js
 
 /* Forward declarations */
 static void fill_all_fields(struct ioperf_io_ctx *ctx);
-static bool rate_limit_check(void *ch, struct ioperf_bdev *ioperf, struct ioperf_io_ctx *io_ctx, bool is_thread_ctx);
+static bool rate_limit_check(void *ch, struct ioperf_bdev *ioperf, struct ioperf_io_ctx *io_ctx);
 static void ioperf_process_io_on_target(void *ctx);
 static int ioperf_wait_poll(void *ctx);
 static void ioperf_register_thread(void *ctx);
@@ -50,90 +49,6 @@ static int ioperf_thread_poll(void *ctx);
 static void ioperf_reg_access(void);
 static void ioperf_mem_barrier(void);
 static uint32_t ioperf_hash_lba(uint64_t lba, uint32_t num_threads);
-
-/* Collect SPDK threads for IO routing */
-static void
-ioperf_register_thread(void *ctx)
-{
-    struct ioperf_thread_mgr *mgr = ctx;
-    uint32_t count = __atomic_fetch_add(&mgr->thread_count, 1, __ATOMIC_RELAXED);
-    if (count < 128) {
-        mgr->threads[count] = spdk_get_thread();
-    }
-}
-
-/* Thread collection for per-thread context management */
-void
-ioperf_collect_thread(void *ctx)
-{
-    struct ioperf_thread_mgr *mgr = ctx;
-    struct spdk_thread *thread = spdk_get_thread();
-    struct ioperf_thread_ctx *thread_ctx;
-    uint32_t i;
-
-    if (!mgr || !thread) {
-        return;
-    }
-
-    /* Check if thread already has context by searching existing contexts */
-    for (i = 0; i < mgr->thread_count; i++) {
-        if (mgr->ctxs[i]->thread == thread) {
-            return;
-        }
-    }
-
-    /* Allocate thread context */
-    thread_ctx = calloc(1, sizeof(*thread_ctx));
-    if (!thread_ctx) {
-        SPDK_ERRLOG("Failed to allocate thread context\n");
-        return;
-    }
-
-    /* Assign sequential thread_id */
-    thread_ctx->thread_id = __atomic_fetch_add(&mgr->next_id, 1, __ATOMIC_RELAXED);
-    thread_ctx->thread = thread;
-    TAILQ_INIT(&thread_ctx->wait_queue);
-    TAILQ_INIT(&thread_ctx->rate_limit_queue);
-    thread_ctx->last_time = 0;
-    thread_ctx->token_bucket = 0;
-
-    /* Register poller */
-    thread_ctx->poller = spdk_poller_register(ioperf_thread_poll, thread_ctx, 0);
-    if (!thread_ctx->poller) {
-        SPDK_ERRLOG("Failed to register poller for thread\n");
-        free(thread_ctx);
-        return;
-    }
-
-    /* Calculate delay_ticks for 100us */
-    thread_ctx->delay_ticks = spdk_get_ticks_hz() / 10000;
-
-    /* Add to array */
-    void *new_ptr = realloc(mgr->ctxs, (mgr->thread_count + 1) * sizeof(*mgr->ctxs));
-    if (!new_ptr) {
-        SPDK_ERRLOG("Failed to expand thread context array\n");
-        spdk_poller_unregister(&thread_ctx->poller);
-        free(thread_ctx);
-        return;
-    }
-    mgr->ctxs = new_ptr;
-    mgr->ctxs[mgr->thread_count++] = thread_ctx;
-}
-
-/* Get thread ID for current thread */
-uint32_t
-ioperf_get_thread_id(void)
-{
-    struct spdk_thread *thread = spdk_get_thread();
-    uint32_t i;
-
-    /* Search through registered thread contexts */
-    for (i = 0; i < g_ioperf_thread_mgr.thread_count; i++) {
-        if (g_ioperf_thread_mgr.ctxs[i]->thread == thread) {
-            return g_ioperf_thread_mgr.ctxs[i]->thread_id;
-        }
-    }
-    return UINT32_MAX;
 }
 
 /* Stub for per-thread poller - implemented in Task 3 */
@@ -171,10 +86,10 @@ ioperf_thread_poll(void *ctx)
     struct ioperf_io_ctx *rl_ctx, *rl_tmp;
     TAILQ_FOREACH_SAFE(rl_ctx, &ch->rate_limit_queue, link, rl_tmp) {
         struct ioperf_bdev *ioperf = (struct ioperf_bdev *)rl_ctx->bio->bdev->ctxt;
-        if (rate_limit_check(ch, ioperf, rl_ctx, true)) {
+        if (rate_limit_check(ch, ioperf, rl_ctx)) {
             TAILQ_REMOVE(&ch->rate_limit_queue, rl_ctx, link);
-            /* Retry - process in current thread */
-            spdk_thread_send_msg(rl_ctx->src_thread, ioperf_process_io_on_target, rl_ctx);
+            /* Process in local thread - no cross-thread sending */
+            ioperf_process_io_on_target(rl_ctx);
         }
     }
 
@@ -367,22 +282,17 @@ ioperf_wait_poll(void *ctx)
 
     /* Process rate limit queue - try to resubmit IO */
     struct ioperf_io_ctx *rl_ctx, *rl_tmp;
+    struct spdk_thread *current_thread = spdk_get_thread();
     TAILQ_FOREACH_SAFE(rl_ctx, &ch->rate_limit_queue, link, rl_tmp) {
         struct ioperf_bdev *ioperf = (struct ioperf_bdev *)rl_ctx->bio->bdev->ctxt;
-        if (rate_limit_check(ch, ioperf, rl_ctx, false)) {
-            /* Rate limit passed, resubmit to target thread */
+        if (rate_limit_check(ch, ioperf, rl_ctx)) {
+            /* Rate limit passed, process in local thread */
             TAILQ_REMOVE(&ch->rate_limit_queue, rl_ctx, link);
-            uint32_t target_thread_idx = ioperf_hash_lba(rl_ctx->bio->u.bdev.offset_blocks, ioperf->num_threads);
-            struct spdk_thread *target_thread;
-            if (g_ioperf_thread_mgr.thread_count > 0) {
-                target_thread = g_ioperf_thread_mgr.threads[target_thread_idx % g_ioperf_thread_mgr.thread_count];
-            } else {
-                target_thread = rl_ctx->src_thread;
-            }
-            rl_ctx->target_thread = target_thread_idx;
+            /* Update hash map values */
             rl_ctx->hash_map_value_1 = (int)(rl_ctx->bio->u.bdev.offset_blocks % ioperf->hash_map_1.size);
             rl_ctx->hash_map_value_2 = (int)((rl_ctx->bio->u.bdev.offset_blocks / 1000) % ioperf->hash_map_2.size);
-            spdk_thread_send_msg(rl_ctx->src_thread, ioperf_process_io_on_target, rl_ctx);
+            /* Process in current thread - no cross-thread sending */
+            ioperf_process_io_on_target(rl_ctx);
         }
     }
 
@@ -563,28 +473,17 @@ fill_all_fields(struct ioperf_io_ctx *ctx)
 }
 
 static bool
-rate_limit_check(void *ch, struct ioperf_bdev *ioperf, struct ioperf_io_ctx *io_ctx, bool is_thread_ctx)
+rate_limit_check(void *ch, struct ioperf_bdev *ioperf, struct ioperf_io_ctx *io_ctx)
 {
     if (ioperf == NULL) {
         return true;
     }
 
-    /* Use is_thread_ctx parameter to determine context type */
-    struct ioperf_thread_ctx *thread_ctx = (struct ioperf_thread_ctx *)ch;
+    /* Use ioperf_io_channel for rate limiting */
     struct ioperf_io_channel *channel = (struct ioperf_io_channel *)ch;
 
-    uint64_t *last_time_ptr;
-    uint64_t *token_bucket_ptr;
-
-    if (is_thread_ctx) {
-        /* This is a thread context */
-        last_time_ptr = &thread_ctx->last_time;
-        token_bucket_ptr = &thread_ctx->token_bucket;
-    } else {
-        /* This is an IO channel */
-        last_time_ptr = &channel->last_time;
-        token_bucket_ptr = &channel->token_bucket;
-    }
+    uint64_t *last_time_ptr = &channel->last_time;
+    uint64_t *token_bucket_ptr = &channel->token_bucket;
 
     /* Initialize last_time on first call */
     if (*last_time_ptr == 0) {
@@ -684,28 +583,6 @@ bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bde
         return;
     }
 
-    /* Lazy thread collection - initialize thread manager on first IO */
-    if (g_ioperf_thread_mgr.ctxs == NULL) {
-        /* Initialize thread manager arrays */
-        g_ioperf_thread_mgr.threads = calloc(128, sizeof(struct spdk_thread *));
-        g_ioperf_thread_mgr.ctxs = calloc(128, sizeof(struct ioperf_thread_ctx *));
-        g_ioperf_thread_mgr.thread_count = 0;
-        g_ioperf_thread_mgr.thread_allocs = 128;
-
-        /* Collect current thread into thread manager */
-        ioperf_collect_thread(&g_ioperf_thread_mgr);
-    }
-
-    /* Collect current thread into global thread manager */
-    for (i = 0; i < g_ioperf_thread_mgr.thread_count; i++) {
-        if (g_ioperf_thread_mgr.threads[i] == current_thread) {
-            return;  /* Already registered */
-        }
-    }
-    if (g_ioperf_thread_mgr.thread_count < g_ioperf_thread_mgr.thread_allocs) {
-        g_ioperf_thread_mgr.threads[g_ioperf_thread_mgr.thread_count++] = current_thread;
-    }
-
     /* Allocate IO context from memory pool first */
     io_ctx = spdk_mempool_get(ioperf->io_pool);
     if (!io_ctx) {
@@ -720,7 +597,7 @@ bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bde
 
     /* Check rate limit on source thread */
     struct ioperf_io_channel *src_ch = spdk_io_channel_get_ctx(_ch);
-    if (!rate_limit_check(src_ch, ioperf, io_ctx, false)) {
+    if (!rate_limit_check(src_ch, ioperf, io_ctx)) {
         /* Rate limited - IO added to rate_limit_queue, will retry */
         return;
     }
@@ -978,12 +855,6 @@ bdev_ioperf_initialize(void)
     spdk_io_device_register(&g_ioperf_bdev_head, ioperf_bdev_create_cb, ioperf_bdev_destroy_cb,
                             sizeof(struct ioperf_io_channel), "ioperf_bdev");
 
-    /* Initialize thread manager */
-    g_ioperf_thread_mgr.ctxs = NULL;
-    g_ioperf_thread_mgr.threads = NULL;
-    g_ioperf_thread_mgr.thread_count = 0;
-    __atomic_store_n(&g_ioperf_thread_mgr.next_id, 0, __ATOMIC_RELAXED);
-
     /* Initialize RPC handlers */
     bdev_ioperf_rpc_init();
 
@@ -995,44 +866,6 @@ bdev_ioperf_initialize(void)
 static void
 bdev_ioperf_finish(void)
 {
-    if (!g_ioperf_thread_mgr.ctxs) {
-        return;
-    }
-
-    /* Drain wait_queues and cleanup each thread */
-    for (uint32_t i = 0; i < g_ioperf_thread_mgr.thread_count; i++) {
-        struct ioperf_thread_ctx *thread_ctx = g_ioperf_thread_mgr.ctxs[i];
-        struct ioperf_io_ctx *io_ctx;
-
-        /* Drain wait_queue */
-        while (!TAILQ_EMPTY(&thread_ctx->wait_queue)) {
-            io_ctx = TAILQ_FIRST(&thread_ctx->wait_queue);
-            TAILQ_REMOVE(&thread_ctx->wait_queue, io_ctx, link);
-            spdk_bdev_io_complete(io_ctx->bio, SPDK_BDEV_IO_STATUS_ABORTED);
-            struct ioperf_bdev *ioperf = (struct ioperf_bdev *)io_ctx->bio->bdev->ctxt;
-            spdk_mempool_put(ioperf->io_pool, io_ctx);
-        }
-
-        /* Drain rate_limit_queue */
-        while (!TAILQ_EMPTY(&thread_ctx->rate_limit_queue)) {
-            io_ctx = TAILQ_FIRST(&thread_ctx->rate_limit_queue);
-            TAILQ_REMOVE(&thread_ctx->rate_limit_queue, io_ctx, link);
-            spdk_bdev_io_complete(io_ctx->bio, SPDK_BDEV_IO_STATUS_ABORTED);
-            struct ioperf_bdev *ioperf = (struct ioperf_bdev *)io_ctx->bio->bdev->ctxt;
-            spdk_mempool_put(ioperf->io_pool, io_ctx);
-        }
-
-        /* Unregister poller */
-        if (thread_ctx->poller) {
-            spdk_poller_unregister(&thread_ctx->poller);
-        }
-
-        /* Free thread context */
-        free(thread_ctx);
-    }
-
-    /* Free array and reset manager */
-    free(g_ioperf_thread_mgr.ctxs);
-    g_ioperf_thread_mgr.ctxs = NULL;
-    g_ioperf_thread_mgr.thread_count = 0;
+    /* ioperf bdev cleanup is handled by spdk_io_device_unregister */
+    /* Individual thread channels are cleaned up by SPDK's IO channel destroy */
 }

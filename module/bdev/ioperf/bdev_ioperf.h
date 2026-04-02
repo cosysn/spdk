@@ -48,22 +48,6 @@ extern struct ioperf_bdev *g_ioperf_bdev;
 /* Getter for bdev list - implemented in bdev_ioperf.c */
 struct ioperf_bdev *ioperf_get_bdev_head(void);
 
-/* Global thread manager */
-struct ioperf_thread_mgr {
-    struct ioperf_thread_ctx **ctxs;   /* Array of thread contexts */
-    struct spdk_thread        **threads;  /* Array of SPDK thread handles */
-    uint32_t                thread_count;
-    uint32_t                thread_allocs;  /* Pre-allocated size */
-    _Atomic uint32_t        next_id;
-};
-extern struct ioperf_thread_mgr g_ioperf_thread_mgr;
-
-/* Getter for thread ID - implemented in bdev_ioperf.c */
-uint32_t ioperf_get_thread_id(void);
-
-/* Thread collection callback - implemented in bdev_ioperf.c */
-void ioperf_collect_thread(void *ctx);
-
 /* Hash map structure */
 struct ioperf_hash_map {
     pthread_rwlock_t    lock;
@@ -97,7 +81,7 @@ struct ioperf_bdev {
     struct ioperf_hash_map     hash_map_2;
 };
 
-/* IO channel structure (per thread) - use this instead of ioperf_thread_ctx */
+/* IO channel structure (per thread) */
 struct ioperf_io_channel {
     TAILQ_HEAD(, ioperf_io_ctx)    wait_queue;      /* IO waiting for 100us delay */
     TAILQ_HEAD(, ioperf_io_ctx)    rate_limit_queue; /* IO waiting for rate limit */
@@ -107,19 +91,6 @@ struct ioperf_io_channel {
     uint64_t                        delay_ticks;        /* 100us delay in ticks */
     uint32_t                        thread_id;
     struct spdk_poller             *wait_poller;
-};
-
-/* Per-thread context structure */
-struct ioperf_thread_ctx {
-    uint32_t                    thread_id;           /* Sequential ID (0-based) */
-    struct spdk_thread         *thread;             /* SPDK thread handle */
-    TAILQ_HEAD(, ioperf_io_ctx) wait_queue;       /* IO wait queue (100us delay) */
-    TAILQ_HEAD(, ioperf_io_ctx) rate_limit_queue; /* IO rate limit queue */
-    struct spdk_poller         *poller;             /* Wait queue poller */
-    uint64_t                   delay_ticks;        /* 100us delay in ticks */
-    uint64_t                   last_time;           /* Last rate limit check time */
-    uint64_t                   token_bucket;       /* Rate limit token bucket */
-    TAILQ_ENTRY(ioperf_thread_ctx) link;
 };
 
 /* IO request structure - allocated from memory pool */
