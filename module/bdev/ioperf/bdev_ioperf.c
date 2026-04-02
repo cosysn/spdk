@@ -760,19 +760,14 @@ bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bde
 
     /* Collect current thread into thread pool if not already present */
     if (ioperf->thread_pool) {
-        for (i = 0; i < ioperf->num_threads; i++) {
+        for (i = 0; i < ioperf->thread_pool_size; i++) {
             if (ioperf->thread_pool[i] == current_thread) {
-                break;
+                return;  /* Already registered */
             }
-            if (ioperf->thread_pool[i] == NULL) {
-                /* Use atomic CAS to avoid race */
-                struct spdk_thread *expected = NULL;
-                if (__atomic_compare_exchange(&ioperf->thread_pool[i], &expected, &current_thread,
-                                          false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
-                    __atomic_fetch_add(&ioperf->thread_pool_size, 1, __ATOMIC_RELAXED);
-                }
-                break;
-            }
+        }
+        /* Not found, add to next slot */
+        if (ioperf->thread_pool_size < ioperf->num_threads) {
+            ioperf->thread_pool[ioperf->thread_pool_size++] = current_thread;
         }
     }
 
