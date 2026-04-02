@@ -97,13 +97,14 @@ struct ioperf_bdev {
     struct ioperf_hash_map     hash_map_2;
 };
 
-/* IO channel structure (per thread) */
+/* IO channel structure (per thread) - use this instead of ioperf_thread_ctx */
 struct ioperf_io_channel {
     TAILQ_HEAD(, ioperf_io_ctx)    wait_queue;      /* IO waiting for 100us delay */
     TAILQ_HEAD(, ioperf_io_ctx)    rate_limit_queue; /* IO waiting for rate limit */
     uint64_t                        queued_io;
     uint64_t                        last_time;
     uint64_t                        token_bucket;
+    uint64_t                        delay_ticks;        /* 100us delay in ticks */
     uint32_t                        thread_id;
     struct spdk_poller             *wait_poller;
 };

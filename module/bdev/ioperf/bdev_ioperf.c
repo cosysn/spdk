@@ -140,14 +140,15 @@ ioperf_get_thread_id(void)
 static int
 ioperf_thread_poll(void *ctx)
 {
-    struct ioperf_thread_ctx *thread_ctx = ctx;
+    /* Get thread-local channel directly */
+    struct ioperf_io_channel *ch = ctx;
     struct ioperf_io_ctx *io_ctx, *tmp;
     uint64_t now = spdk_get_ticks();
 
     /* Process wait queue - complete IO that has waited >100us */
-    TAILQ_FOREACH_SAFE(io_ctx, &thread_ctx->wait_queue, link, tmp) {
-        if (now - io_ctx->queued_io >= thread_ctx->delay_ticks) {
-            TAILQ_REMOVE(&thread_ctx->wait_queue, io_ctx, link);
+    TAILQ_FOREACH_SAFE(io_ctx, &ch->wait_queue, link, tmp) {
+        if (now - io_ctx->queued_io >= ch->delay_ticks) {
+            TAILQ_REMOVE(&ch->wait_queue, io_ctx, link);
 
             /* Simulate hardware register access delay */
             ioperf_reg_access();
@@ -168,21 +169,11 @@ ioperf_thread_poll(void *ctx)
 
     /* Process rate limit queue - retry IO that is now within rate limit */
     struct ioperf_io_ctx *rl_ctx, *rl_tmp;
-    TAILQ_FOREACH_SAFE(rl_ctx, &thread_ctx->rate_limit_queue, link, rl_tmp) {
+    TAILQ_FOREACH_SAFE(rl_ctx, &ch->rate_limit_queue, link, rl_tmp) {
         struct ioperf_bdev *ioperf = (struct ioperf_bdev *)rl_ctx->bio->bdev->ctxt;
-        if (rate_limit_check(thread_ctx, ioperf, rl_ctx, true)) {
-            TAILQ_REMOVE(&thread_ctx->rate_limit_queue, rl_ctx, link);
-            /* Retry - send to target thread for processing */
-            uint32_t target_thread_idx = ioperf_hash_lba(rl_ctx->bio->u.bdev.offset_blocks, ioperf->num_threads);
-            struct spdk_thread *target_thread;
-            if (g_ioperf_thread_mgr.thread_count > 0) {
-                target_thread = g_ioperf_thread_mgr.threads[target_thread_idx % g_ioperf_thread_mgr.thread_count];
-            } else {
-                target_thread = rl_ctx->src_thread;
-            }
-            rl_ctx->target_thread = target_thread_idx;
-            rl_ctx->hash_map_value_1 = (int)(rl_ctx->bio->u.bdev.offset_blocks % ioperf->hash_map_1.size);
-            rl_ctx->hash_map_value_2 = (int)((rl_ctx->bio->u.bdev.offset_blocks / 1000) % ioperf->hash_map_2.size);
+        if (rate_limit_check(ch, ioperf, rl_ctx, true)) {
+            TAILQ_REMOVE(&ch->rate_limit_queue, rl_ctx, link);
+            /* Retry - process in current thread */
             spdk_thread_send_msg(rl_ctx->src_thread, ioperf_process_io_on_target, rl_ctx);
         }
     }
@@ -403,53 +394,13 @@ static void
 ioperf_process_io_on_target(void *ctx)
 {
     struct ioperf_io_ctx *io_ctx = (struct ioperf_io_ctx *)ctx;
-    struct ioperf_thread_ctx *thread_ctx = NULL;
+    /* Get thread-local context directly from SPDK */
+    struct ioperf_io_channel *ch = spdk_thread_get_ctx(spdk_get_thread());
     struct ioperf_io_ctx *wait_ctx, *tmp;
-    struct spdk_thread *thread = spdk_get_thread();
-    uint32_t i;
     uint64_t now = spdk_get_ticks();
 
-    /* Lazy-collect thread if not already present */
-    if (g_ioperf_thread_mgr.ctxs == NULL) {
-        g_ioperf_thread_mgr.threads = calloc(128, sizeof(struct spdk_thread *));
-        g_ioperf_thread_mgr.ctxs = calloc(128, sizeof(struct ioperf_thread_ctx *));
-        g_ioperf_thread_mgr.thread_count = 0;
-        g_ioperf_thread_mgr.thread_allocs = 128;
-        ioperf_collect_thread(&g_ioperf_thread_mgr);
-    }
-
-    /* Find current thread's context by searching array */
-    for (i = 0; i < g_ioperf_thread_mgr.thread_count; i++) {
-        if (g_ioperf_thread_mgr.ctxs[i]->thread == thread) {
-            thread_ctx = g_ioperf_thread_mgr.ctxs[i];
-            break;
-        }
-    }
-
-    /* If still not found, try to collect this thread */
-    if (!thread_ctx) {
-        bool found = false;
-        for (i = 0; i < g_ioperf_thread_mgr.thread_count; i++) {
-            if (g_ioperf_thread_mgr.ctxs[i]->thread == thread) {
-                thread_ctx = g_ioperf_thread_mgr.ctxs[i];
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            ioperf_collect_thread(&g_ioperf_thread_mgr);
-            /* Search again after collection */
-            for (i = 0; i < g_ioperf_thread_mgr.thread_count; i++) {
-                if (g_ioperf_thread_mgr.ctxs[i]->thread == thread) {
-                    thread_ctx = g_ioperf_thread_mgr.ctxs[i];
-                    break;
-                }
-            }
-        }
-    }
-
-    if (!thread_ctx) {
-        /* Should not happen, but handle gracefully */
+    if (!ch) {
+        /* Channel not initialized, fail */
         spdk_bdev_io_complete(io_ctx->bio, SPDK_BDEV_IO_STATUS_FAILED);
         struct ioperf_bdev *ioperf = (struct ioperf_bdev *)io_ctx->bio->bdev->ctxt;
         spdk_mempool_put(ioperf->io_pool, io_ctx);
@@ -457,9 +408,9 @@ ioperf_process_io_on_target(void *ctx)
     }
 
     /* Check wait queue - process IO that has been waiting >100us */
-    TAILQ_FOREACH_SAFE(wait_ctx, &thread_ctx->wait_queue, link, tmp) {
-        if (now - wait_ctx->queued_io >= thread_ctx->delay_ticks) {
-            TAILQ_REMOVE(&thread_ctx->wait_queue, wait_ctx, link);
+    TAILQ_FOREACH_SAFE(wait_ctx, &ch->wait_queue, link, tmp) {
+        if (now - wait_ctx->queued_io >= ch->queued_io) {
+            TAILQ_REMOVE(&ch->wait_queue, wait_ctx, link);
             ioperf_reg_access();
             ioperf_mem_barrier();
             fill_all_fields(wait_ctx);
@@ -473,7 +424,7 @@ ioperf_process_io_on_target(void *ctx)
 
     /* Add new IO to wait queue */
     io_ctx->queued_io = spdk_get_ticks();
-    TAILQ_INSERT_TAIL(&thread_ctx->wait_queue, io_ctx, link);
+    TAILQ_INSERT_TAIL(&ch->wait_queue, io_ctx, link);
 }
 
 static void
