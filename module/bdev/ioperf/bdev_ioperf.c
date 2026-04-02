@@ -72,11 +72,8 @@ ioperf_collect_thread(void *ctx)
     uint32_t i;
 
     if (!mgr || !thread) {
-        SPDK_ERRLOG("ioperf_collect_thread: invalid params mgr=%p thread=%p\n", mgr, thread);
         return;
     }
-
-    SPDK_NOTICELOG("ioperf_collect_thread: processing thread\n");
 
     /* Check if thread already has context by searching existing contexts */
     for (i = 0; i < mgr->thread_count; i++) {
@@ -452,8 +449,6 @@ ioperf_process_io_on_target(void *ctx)
 
     if (!thread_ctx) {
         /* Should not happen, but handle gracefully */
-        SPDK_ERRLOG("ioperf_process_io_on_target: thread_ctx not found, thread=%p, collected_count=%u\n",
-                   (void*)thread, g_ioperf_thread_mgr.thread_count);
         spdk_bdev_io_complete(io_ctx->bio, SPDK_BDEV_IO_STATUS_FAILED);
         struct ioperf_bdev *ioperf = (struct ioperf_bdev *)io_ctx->bio->bdev->ctxt;
         spdk_mempool_put(ioperf->io_pool, io_ctx);
@@ -835,9 +830,7 @@ bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bde
     io_ctx->hash_map_value_2 = (int)((lba / 1000) % ioperf->hash_map_2.size);
 
     /* Send to target thread (including same thread) for 100us delay */
-    SPDK_NOTICELOG("submit_request: sending IO to target_thread=%p (idx=%u)\n", (void*)target_thread, target_thread_idx);
     spdk_thread_send_msg(target_thread, ioperf_process_io_on_target, io_ctx);
-    SPDK_NOTICELOG("submit_request: IO sent\n");
 }
 
 static bool
