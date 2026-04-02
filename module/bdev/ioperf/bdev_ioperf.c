@@ -761,14 +761,16 @@ bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bde
     /* Collect current thread into thread pool if not already present */
     if (ioperf->thread_pool) {
         bool found = false;
-        for (i = 0; i < ioperf->thread_pool_size; i++) {
+        for (i = 0; i < ioperf->num_threads; i++) {
             if (ioperf->thread_pool[i] == current_thread) {
                 found = true;
                 break;
             }
-        }
-        if (!found && ioperf->thread_pool_size < ioperf->num_threads) {
-            ioperf->thread_pool[ioperf->thread_pool_size++] = current_thread;
+            if (ioperf->thread_pool[i] == NULL) {
+                ioperf->thread_pool[i] = current_thread;
+                ioperf->thread_pool_size++;
+                break;
+            }
         }
     }
 
