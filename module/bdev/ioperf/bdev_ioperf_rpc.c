@@ -99,13 +99,20 @@ rpc_bdev_ioperf_create(struct spdk_jsonrpc_request *request,
 
 	rc = bdev_ioperf_create(&bdev, &opts);
 	if (rc != 0) {
+		SPDK_ERRLOG("bdev_ioperf_create: failed with rc=%d\n", rc);
 		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
 		goto cleanup;
 	}
 
+	SPDK_NOTICELOG("RPC: bdev created successfully, name=%s\n", bdev->name);
+
 	w = spdk_jsonrpc_begin_result(request);
 	spdk_json_write_string(w, bdev->name);
 	spdk_jsonrpc_end_result(request, w);
+	SPDK_NOTICELOG("RPC: response sent\n");
+
+	free_rpc_bdev_ioperf_create(&req);
+	return;
 
 cleanup:
 	free_rpc_bdev_ioperf_create(&req);

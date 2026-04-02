@@ -20,6 +20,7 @@ RPC_SOCKET="/var/tmp/spdk.sock"
 # SPDK build directory
 SPDK_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 BUILD_DIR="$SPDK_DIR/build"
+BDEVPERF="$SPDK_DIR/test/bdev/bdevperf/bdevperf"
 
 usage() {
     echo "Usage: $0 [options]"
@@ -94,7 +95,7 @@ start_spdk_tgt() {
     kill_spdk_tgt
 
     echo "Starting spdk_tgt with ioperf bdev..."
-    sudo "$BUILD_DIR/spdk_tgt" -m 0x1 -S "$RPC_SOCKET" -f /tmp/ioperf_config.json &
+    sudo "$BUILD_DIR/spdk_tgt" -m 0x3 -S "$RPC_SOCKET" -f /tmp/ioperf_config.json &
     sleep 3
 }
 
@@ -126,7 +127,7 @@ fi
 
 # Run bdevperf
 echo "Running performance test..."
-sudo "$BUILD_DIR/examples/bdevperf" $BDEV_ARG -q "$QUEUE_DEPTH" -o "$IO_SIZE" -w "$WORKLOAD" -t "$RUNTIME" -L
+sudo "$BDEVPERF" $BDEV_ARG -q "$QUEUE_DEPTH" -o "$IO_SIZE" -w "$WORKLOAD" -t "$RUNTIME" -L
 
 # Cleanup
 echo "Cleaning up..."

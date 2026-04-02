@@ -22,7 +22,7 @@
 extern int bdev_ioperf_rpc_init(void);
 
 /* Global ioperf bdev list */
-TAILQ_HEAD(, ioperf_bdev) g_ioperf_bdev_head;
+static TAILQ_HEAD(ioperf_bdev_head, ioperf_bdev) g_ioperf_bdev_head = TAILQ_HEAD_INITIALIZER(g_ioperf_bdev_head);
 struct ioperf_bdev *g_ioperf_bdev;
 struct ioperf_thread_mgr g_ioperf_thread_mgr;
 
@@ -71,6 +71,13 @@ ioperf_collect_thread(void *ctx)
     struct ioperf_thread_ctx *thread_ctx;
     uint32_t i;
 
+    if (!mgr || !thread) {
+        SPDK_ERRLOG("ioperf_collect_thread: invalid params mgr=%p thread=%p\n", mgr, thread);
+        return;
+    }
+
+    SPDK_NOTICELOG("ioperf_collect_thread: processing thread\n");
+
     /* Check if thread already has context by searching existing contexts */
     for (i = 0; i < mgr->thread_count; i++) {
         if (mgr->ctxs[i]->thread == thread) {
@@ -95,6 +102,11 @@ ioperf_collect_thread(void *ctx)
 
     /* Register poller */
     thread_ctx->poller = spdk_poller_register(ioperf_thread_poll, thread_ctx, 0);
+    if (!thread_ctx->poller) {
+        SPDK_ERRLOG("Failed to register poller for thread\n");
+        free(thread_ctx);
+        return;
+    }
 
     /* Calculate delay_ticks for 100us */
     thread_ctx->delay_ticks = spdk_get_ticks_hz() / 10000;
@@ -400,6 +412,14 @@ ioperf_process_io_on_target(void *ctx)
     uint32_t i;
     uint64_t now = spdk_get_ticks();
 
+    /* Lazy-collect thread if not already present */
+    if (g_ioperf_thread_mgr.ctxs == NULL) {
+        g_ioperf_thread_mgr.threads = calloc(128, sizeof(struct spdk_thread *));
+        g_ioperf_thread_mgr.ctxs = NULL;
+        g_ioperf_thread_mgr.thread_count = 0;
+        ioperf_collect_thread(&g_ioperf_thread_mgr);
+    }
+
     /* Find current thread's context by searching array */
     for (i = 0; i < g_ioperf_thread_mgr.thread_count; i++) {
         if (g_ioperf_thread_mgr.ctxs[i]->thread == thread) {
@@ -408,8 +428,32 @@ ioperf_process_io_on_target(void *ctx)
         }
     }
 
+    /* If still not found, try to collect this thread */
+    if (!thread_ctx) {
+        bool found = false;
+        for (i = 0; i < g_ioperf_thread_mgr.thread_count; i++) {
+            if (g_ioperf_thread_mgr.ctxs[i]->thread == thread) {
+                thread_ctx = g_ioperf_thread_mgr.ctxs[i];
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            ioperf_collect_thread(&g_ioperf_thread_mgr);
+            /* Search again after collection */
+            for (i = 0; i < g_ioperf_thread_mgr.thread_count; i++) {
+                if (g_ioperf_thread_mgr.ctxs[i]->thread == thread) {
+                    thread_ctx = g_ioperf_thread_mgr.ctxs[i];
+                    break;
+                }
+            }
+        }
+    }
+
     if (!thread_ctx) {
         /* Should not happen, but handle gracefully */
+        SPDK_ERRLOG("ioperf_process_io_on_target: thread_ctx not found, thread=%p, collected_count=%u\n",
+                   (void*)thread, g_ioperf_thread_mgr.thread_count);
         spdk_bdev_io_complete(io_ctx->bio, SPDK_BDEV_IO_STATUS_FAILED);
         struct ioperf_bdev *ioperf = (struct ioperf_bdev *)io_ctx->bio->bdev->ctxt;
         spdk_mempool_put(ioperf->io_pool, io_ctx);
@@ -708,6 +752,17 @@ bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bde
         return;
     }
 
+    /* Lazy thread collection - initialize thread manager on first IO */
+    if (g_ioperf_thread_mgr.ctxs == NULL) {
+        /* Initialize thread manager arrays */
+        g_ioperf_thread_mgr.threads = calloc(128, sizeof(struct spdk_thread *));
+        g_ioperf_thread_mgr.ctxs = calloc(128, sizeof(struct ioperf_thread_ctx *));
+        g_ioperf_thread_mgr.thread_count = 0;
+
+        /* Collect current thread into thread manager */
+        ioperf_collect_thread(&g_ioperf_thread_mgr);
+    }
+
     /* Collect current thread into thread pool if not already present */
     if (ioperf->thread_pool) {
         bool found = false;
@@ -754,6 +809,20 @@ bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bde
         target_thread_idx = 0;
     }
 
+    /* Lazy-collect target thread if needed */
+    if (g_ioperf_thread_mgr.ctxs != NULL) {
+        bool target_found = false;
+        for (i = 0; i < g_ioperf_thread_mgr.thread_count; i++) {
+            if (g_ioperf_thread_mgr.ctxs[i]->thread == target_thread) {
+                target_found = true;
+                break;
+            }
+        }
+        if (!target_found) {
+            ioperf_collect_thread(&g_ioperf_thread_mgr);
+        }
+    }
+
     io_ctx->target_thread = target_thread_idx;
     if (!io_ctx) {
         SPDK_ERRLOG("Failed to get IO context from pool\n");
@@ -766,7 +835,9 @@ bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bde
     io_ctx->hash_map_value_2 = (int)((lba / 1000) % ioperf->hash_map_2.size);
 
     /* Send to target thread (including same thread) for 100us delay */
+    SPDK_NOTICELOG("submit_request: sending IO to target_thread=%p (idx=%u)\n", (void*)target_thread, target_thread_idx);
     spdk_thread_send_msg(target_thread, ioperf_process_io_on_target, io_ctx);
+    SPDK_NOTICELOG("submit_request: IO sent\n");
 }
 
 static bool
@@ -917,6 +988,9 @@ bdev_ioperf_create(struct spdk_bdev **bdev, const struct ioperf_bdev_opts *opts)
     ioperf->total_io = 0;
     ioperf->total_bytes = 0;
 
+    SPDK_NOTICELOG("ioperf: creating bdev with %u threads, read_latency=%lu us, write_latency=%lu us\n",
+               ioperf->num_threads, ioperf->read_latency_us, ioperf->write_latency_us);
+
     /* Create worker threads */
     rc = ioperf_init_thread_pool(ioperf);
     if (rc) {
@@ -927,13 +1001,15 @@ bdev_ioperf_create(struct spdk_bdev **bdev, const struct ioperf_bdev_opts *opts)
         return rc;
     }
 
-    /* Collect threads for IO routing at bdev create time */
-    if (g_ioperf_thread_mgr.thread_count == 0) {
-        spdk_for_each_thread(ioperf_collect_thread, &g_ioperf_thread_mgr, NULL);
-    }
+    /* Thread collection is done lazily on first IO submission
+     * Removing spdk_for_each_thread from here as it causes RPC hang
+     * TODO: Implement lazy thread collection
+     */
 
+    SPDK_NOTICELOG("ioperf: registering bdev\n");
     rc = spdk_bdev_register(&ioperf->bdev);
     if (rc) {
+        SPDK_ERRLOG("ioperf: bdev_register failed with rc=%d\n", rc);
         ioperf_destroy_thread_pool(ioperf);
         ioperf_hash_map_destroy(&ioperf->hash_map_1);
         ioperf_hash_map_destroy(&ioperf->hash_map_2);
@@ -941,11 +1017,17 @@ bdev_ioperf_create(struct spdk_bdev **bdev, const struct ioperf_bdev_opts *opts)
         free(ioperf);
         return rc;
     }
+    SPDK_NOTICELOG("ioperf: bdev registered successfully\n");
 
     *bdev = &(ioperf->bdev);
+    SPDK_NOTICELOG("ioperf: bdev assigned, name=%s\n", ioperf->bdev.name);
 
     TAILQ_INSERT_TAIL(&g_ioperf_bdev_head, ioperf, tailq);
+    SPDK_NOTICELOG("ioperf: added to tailq\n");
+
     g_ioperf_bdev = ioperf;
+    SPDK_NOTICELOG("ioperf: g_ioperf_bdev set\n");
+    SPDK_NOTICELOG("ioperf: bdev_create complete!\n");
 
     return rc;
 }
@@ -997,6 +1079,7 @@ bdev_ioperf_initialize(void)
 
     /* Initialize thread manager */
     g_ioperf_thread_mgr.ctxs = NULL;
+    g_ioperf_thread_mgr.threads = NULL;
     g_ioperf_thread_mgr.thread_count = 0;
     __atomic_store_n(&g_ioperf_thread_mgr.next_id, 0, __ATOMIC_RELAXED);
 
