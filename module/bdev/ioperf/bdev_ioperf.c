@@ -725,34 +725,8 @@ bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bde
         return;
     }
 
-    /* Calculate target thread using LBA hash - use global thread manager */
-    uint32_t thread_count = g_ioperf_thread_mgr.thread_count;
-    uint32_t target_thread_idx;
-
-    if (thread_count > 0) {
-        target_thread_idx = ioperf_hash_lba(lba, thread_count);
-        target_thread = g_ioperf_thread_mgr.threads[target_thread_idx % thread_count];
-    } else {
-        /* No threads registered yet, process on current thread */
-        target_thread = current_thread;
-        target_thread_idx = 0;
-    }
-
-    /* Lazy-collect target thread if needed */
-    if (g_ioperf_thread_mgr.ctxs != NULL) {
-        bool target_found = false;
-        for (i = 0; i < g_ioperf_thread_mgr.thread_count; i++) {
-            if (g_ioperf_thread_mgr.ctxs[i]->thread == target_thread) {
-                target_found = true;
-                break;
-            }
-        }
-        if (!target_found) {
-            ioperf_collect_thread(&g_ioperf_thread_mgr);
-        }
-    }
-
-    io_ctx->target_thread = target_thread_idx;
+    /* Process in current thread only - no cross-thread */
+    io_ctx->target_thread = 0;
     if (!io_ctx) {
         SPDK_ERRLOG("Failed to get IO context from pool\n");
         spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
