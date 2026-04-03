@@ -581,7 +581,8 @@ bdev_ioperf_io_type_supported(void *ctx, enum spdk_bdev_io_type io_type)
 static struct spdk_io_channel *
 bdev_ioperf_get_io_channel(void *ctx)
 {
-    return spdk_get_io_channel(&g_ioperf_bdev_head);
+    /* ctx is the ioperf pointer (bdev->ctxt) - use it for channel lookup */
+    return spdk_get_io_channel(ctx);
 }
 
 static const struct spdk_bdev_fn_table ioperf_fn_table = {
@@ -728,6 +729,11 @@ bdev_ioperf_create(struct spdk_bdev **bdev, const struct ioperf_bdev_opts *opts)
      */
 
     SPDK_NOTICELOG("ioperf: registering bdev\n");
+
+    /* Register io_device with ioperf pointer so get_io_channel works */
+    spdk_io_device_register(ioperf, ioperf_bdev_create_cb, ioperf_bdev_destroy_cb,
+                        sizeof(struct ioperf_io_channel), "ioperf");
+
     rc = spdk_bdev_register(&ioperf->bdev);
     if (rc) {
         SPDK_ERRLOG("ioperf: bdev_register failed with rc=%d\n", rc);
@@ -794,10 +800,6 @@ bdev_ioperf_resize(const char *bdev_name, const uint64_t new_size_in_mb)
 static int
 bdev_ioperf_initialize(void)
 {
-    /* Register the io_device */
-    spdk_io_device_register(&g_ioperf_bdev_head, ioperf_bdev_create_cb, ioperf_bdev_destroy_cb,
-                            sizeof(struct ioperf_io_channel), "ioperf_bdev");
-
     /* Initialize RPC handlers */
     bdev_ioperf_rpc_init();
 
