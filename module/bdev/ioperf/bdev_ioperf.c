@@ -148,6 +148,7 @@ static int
 ioperf_bdev_create_cb(void *io_device, void *ctx_buf)
 {
     struct ioperf_io_channel *ch = ctx_buf;
+    struct ioperf_bdev *ioperf = (struct ioperf_bdev *)io_device;
 
     TAILQ_INIT(&ch->wait_queue);
     TAILQ_INIT(&ch->rate_limit_queue);
@@ -155,7 +156,12 @@ ioperf_bdev_create_cb(void *io_device, void *ctx_buf)
     ch->last_time = 0;
     ch->token_bucket = 0;
     ch->thread_id = 0;
-    ch->wait_poller = NULL;
+
+    /* Reference the ioperf's io_pool for IO context allocation */
+    ch->io_pool = ioperf->io_pool;
+
+    /* Register poller to process delayed IO */
+    ch->wait_poller = SPDK_POLLER_REGISTER(ioperf_wait_poll, ch, 0);
 
     return 0;
 }
@@ -163,7 +169,10 @@ ioperf_bdev_create_cb(void *io_device, void *ctx_buf)
 static void
 ioperf_bdev_destroy_cb(void *io_device, void *ctx_buf)
 {
-    /* Nothing to cleanup */
+    struct ioperf_io_channel *ch = ctx_buf;
+
+    /* Unregister the poller */
+    spdk_poller_unregister(&ch->wait_poller);
 }
 
 static void
@@ -546,6 +555,9 @@ static void
 bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bdev_io)
 {
     struct ioperf_bdev *ioperf;
+    struct ioperf_io_channel *ch;
+    struct ioperf_io_ctx *io_ctx;
+    uint64_t delay_ticks;
 
     /* Get ioperf bdev from bdev context */
     ioperf = (struct ioperf_bdev *)bdev_io->bdev->ctxt;
@@ -554,11 +566,57 @@ bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bde
         return;
     }
 
-    /* Complete the I/O immediately - delay not yet implemented */
-    spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+    /* Calculate delay based on IO type */
+    if (bdev_io->type == SPDK_BDEV_IO_TYPE_READ) {
+        delay_ticks = ioperf->read_latency_us * (spdk_get_ticks_hz() / 1000000);
+    } else if (bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE) {
+        delay_ticks = ioperf->write_latency_us * (spdk_get_ticks_hz() / 1000000);
+    } else {
+        delay_ticks = 0;
+    }
 
-    /* Update stats */
-    ioperf->total_io++;
+    /* If no delay, complete immediately */
+    if (delay_ticks == 0) {
+        spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+        ioperf->total_io++;
+        return;
+    }
+
+    /* Get IO channel - use ioperf's pool directly */
+    ch = (struct ioperf_io_channel *)_ch;
+
+    /* Always use ioperf's pool directly for now */
+    if (ioperf->io_pool == NULL) {
+        /* No pool - complete immediately */
+        spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+        ioperf->total_io++;
+        return;
+    }
+    /* Get io_ctx from ioperf's pool */
+    io_ctx = spdk_mempool_get(ioperf->io_pool);
+    if (io_ctx == NULL) {
+        /* Pool exhausted - complete immediately */
+        spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+        ioperf->total_io++;
+        return;
+    }
+
+    /* Setup IO context for delayed completion */
+    io_ctx->bio = bdev_io;
+    io_ctx->delay_ticks = delay_ticks;
+    io_ctx->queued_io = spdk_get_ticks();
+
+    /* Add to wait queue - use ch if available, otherwise use simple delay path */
+    if (ch != NULL) {
+        TAILQ_INSERT_TAIL(&ch->wait_queue, io_ctx, link);
+        ch->queued_io++;
+    } else {
+        /* No channel - just complete immediately after delay */
+        uint64_t delay_ns = delay_ticks * 1000000000 / spdk_get_ticks_hz();
+        spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+        ioperf->total_io++;
+        spdk_mempool_put(ioperf->io_pool, io_ctx);
+    }
 }
 
 static bool
@@ -800,6 +858,7 @@ bdev_ioperf_resize(const char *bdev_name, const uint64_t new_size_in_mb)
 static int
 bdev_ioperf_initialize(void)
 {
+    /* Register io_device name - but actual registration happens per-bdev */
     /* Initialize RPC handlers */
     bdev_ioperf_rpc_init();
 
