@@ -49,7 +49,6 @@ static int ioperf_thread_poll(void *ctx);
 static void ioperf_reg_access(void);
 static void ioperf_mem_barrier(void);
 static uint32_t ioperf_hash_lba(uint64_t lba, uint32_t num_threads);
-}
 
 /* Stub for per-thread poller - implemented in Task 3 */
 static int
@@ -255,22 +254,20 @@ ioperf_wait_poll(void *ctx)
     uint64_t delay_ticks = spdk_get_ticks_hz() / 10;  /* 100us */
 
     TAILQ_FOREACH_SAFE(wait_ctx, &ch->wait_queue, link, tmp) {
-        if (now - wait_ctx->queued_io >= delay_ticks) {
+        /* Use IO-specific delay from wait_ctx */
+        if (now - wait_ctx->queued_io >= wait_ctx->delay_ticks) {
             TAILQ_REMOVE(&ch->wait_queue, wait_ctx, link);
-            /* Simulate hardware register access delay */
-            ioperf_reg_access();
-            /* Memory barrier */
-            ioperf_mem_barrier();
-            fill_all_fields(wait_ctx);
+            ch->queued_io--;
             spdk_bdev_io_complete(wait_ctx->bio, SPDK_BDEV_IO_STATUS_SUCCESS);
             struct ioperf_bdev *ioperf = (struct ioperf_bdev *)wait_ctx->bio->bdev->ctxt;
-            ioperf->total_io++;
-            ioperf->total_bytes += wait_ctx->bio->u.bdev.num_blocks * wait_ctx->bio->bdev->blocklen;
-            spdk_mempool_put(ioperf->io_pool, wait_ctx);
+            if (ioperf != NULL) {
+                ioperf->total_io++;
+            }
+            spdk_mempool_put(ch->io_pool, wait_ctx);
         }
     }
 
-    /* Process rate limit queue - try to resubmit IO */
+    /* Process rate limit queue */
     struct ioperf_io_ctx *rl_ctx, *rl_tmp;
     struct spdk_thread *current_thread = spdk_get_thread();
     TAILQ_FOREACH_SAFE(rl_ctx, &ch->rate_limit_queue, link, rl_tmp) {
@@ -557,7 +554,7 @@ bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bde
         return;
     }
 
-    /* Complete the I/O immediately */
+    /* Complete the I/O immediately - delay not yet implemented */
     spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
 
     /* Update stats */

@@ -83,7 +83,7 @@ struct ioperf_bdev {
 
 /* IO channel structure (per thread) */
 struct ioperf_io_channel {
-    TAILQ_HEAD(, ioperf_io_ctx)    wait_queue;      /* IO waiting for 100us delay */
+    TAILQ_HEAD(, ioperf_io_ctx)    wait_queue;      /* IO waiting for delay */
     TAILQ_HEAD(, ioperf_io_ctx)    rate_limit_queue; /* IO waiting for rate limit */
     uint64_t                        queued_io;
     uint64_t                        last_time;
@@ -91,6 +91,7 @@ struct ioperf_io_channel {
     uint64_t                        delay_ticks;        /* 100us delay in ticks */
     uint32_t                        thread_id;
     struct spdk_poller             *wait_poller;
+    struct spdk_mempool            *io_pool;           /* IO context pool */
 };
 
 /* IO request structure - allocated from memory pool */
@@ -107,6 +108,7 @@ struct ioperf_io_ctx {
 
     /* Delay timestamp */
     uint64_t                   queued_io;
+    uint64_t                   delay_ticks;
 
     /* Hash map values */
     int                        hash_map_value_1;
