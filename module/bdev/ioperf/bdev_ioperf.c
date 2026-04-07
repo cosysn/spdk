@@ -148,7 +148,8 @@ static int
 ioperf_bdev_create_cb(void *io_device, void *ctx_buf)
 {
     struct ioperf_io_channel *ch = ctx_buf;
-    struct ioperf_bdev *ioperf = (struct ioperf_bdev *)io_device;
+    struct spdk_bdev *bdev = (struct spdk_bdev *)((char *)io_device - 1);
+    struct ioperf_bdev *ioperf = (struct ioperf_bdev *)bdev->ctxt;
 
     TAILQ_INIT(&ch->wait_queue);
     TAILQ_INIT(&ch->rate_limit_queue);
@@ -260,7 +261,12 @@ ioperf_wait_poll(void *ctx)
     struct ioperf_io_channel *ch = (struct ioperf_io_channel *)ctx;
     struct ioperf_io_ctx *wait_ctx, *tmp;
     uint64_t now = spdk_get_ticks();
-    uint64_t delay_ticks = spdk_get_ticks_hz() / 10;  /* 100us */
+
+    /* Debug: log when poller runs with pending IOs */
+    if (ch->queued_io > 0) {
+        SPDK_ERRLOG("ioperf_wait_poll: ch=%p, pending=%lu, now=%lu\n",
+                  ch, ch->queued_io, now);
+    }
 
     TAILQ_FOREACH_SAFE(wait_ctx, &ch->wait_queue, link, tmp) {
         /* Use IO-specific delay from wait_ctx */
@@ -507,9 +513,10 @@ rate_limit_check(void *ch, struct ioperf_bdev *ioperf, struct ioperf_io_ctx *io_
 static int
 ioperf_init_thread_pool(struct ioperf_bdev *ioperf)
 {
-    /* Create memory pool for IO requests (includes routing info + 100+ fields) */
+    /* Create memory pool for IO requests (includes routing info + 100+ fields)
+     * Increase pool size for multi-threaded workloads: 8 threads x 8 depth = 64 concurrent */
     ioperf->io_pool = spdk_mempool_create("ioperf_io_pool",
-                                            4096,
+                                            8192,
                                             sizeof(struct ioperf_io_ctx),
                                             0, -1);
     if (!ioperf->io_pool) {
@@ -608,6 +615,7 @@ bdev_ioperf_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bde
 
     /* Add to wait queue - use ch if available, otherwise use simple delay path */
     if (ch != NULL) {
+        SPDK_ERRLOG("submit_request: queued to wait_queue, ch=%p, queued_io=%lu\n", ch, ch->queued_io + 1);
         TAILQ_INSERT_TAIL(&ch->wait_queue, io_ctx, link);
         ch->queued_io++;
     } else {
@@ -639,8 +647,9 @@ bdev_ioperf_io_type_supported(void *ctx, enum spdk_bdev_io_type io_type)
 static struct spdk_io_channel *
 bdev_ioperf_get_io_channel(void *ctx)
 {
-    /* ctx is the ioperf pointer (bdev->ctxt) - use it for channel lookup */
-    return spdk_get_io_channel(ctx);
+    /* ctx is the ioperf pointer (bdev->ctxt).
+     * Use bdev+1 as the key to match registration in bdev_ioperf_create. */
+    return spdk_get_io_channel((char *)ctx + 1);
 }
 
 static const struct spdk_bdev_fn_table ioperf_fn_table = {
@@ -788,8 +797,10 @@ bdev_ioperf_create(struct spdk_bdev **bdev, const struct ioperf_bdev_opts *opts)
 
     SPDK_NOTICELOG("ioperf: registering bdev\n");
 
-    /* Register io_device with ioperf pointer so get_io_channel works */
-    spdk_io_device_register(ioperf, ioperf_bdev_create_cb, ioperf_bdev_destroy_cb,
+    /* Register io_device with correct key that matches bdev subsystem expectations.
+     * The bdev code uses __bdev_to_io_dev(bdev) = (char *)bdev + 1 as the key.
+     * So we use (char *)&ioperf->bdev + 1 to match. */
+    spdk_io_device_register((char *)&ioperf->bdev + 1, ioperf_bdev_create_cb, ioperf_bdev_destroy_cb,
                         sizeof(struct ioperf_io_channel), "ioperf");
 
     rc = spdk_bdev_register(&ioperf->bdev);
