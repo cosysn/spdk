@@ -148,7 +148,7 @@ static int
 ioperf_bdev_create_cb(void *io_device, void *ctx_buf)
 {
     struct ioperf_io_channel *ch = ctx_buf;
-    struct spdk_bdev *bdev = (struct spdk_bdev *)((char *)io_device - 1);
+    struct spdk_bdev *bdev = (struct spdk_bdev *)io_device;
     struct ioperf_bdev *ioperf = (struct ioperf_bdev *)bdev->ctxt;
 
     TAILQ_INIT(&ch->wait_queue);
@@ -647,9 +647,8 @@ bdev_ioperf_io_type_supported(void *ctx, enum spdk_bdev_io_type io_type)
 static struct spdk_io_channel *
 bdev_ioperf_get_io_channel(void *ctx)
 {
-    /* ctx is the ioperf pointer (bdev->ctxt).
-     * Use bdev+1 as the key to match registration in bdev_ioperf_create. */
-    return spdk_get_io_channel((char *)ctx + 1);
+    /* ctx is the ioperf pointer - use it directly for channel lookup */
+    return spdk_get_io_channel(ctx);
 }
 
 static const struct spdk_bdev_fn_table ioperf_fn_table = {
@@ -797,10 +796,8 @@ bdev_ioperf_create(struct spdk_bdev **bdev, const struct ioperf_bdev_opts *opts)
 
     SPDK_NOTICELOG("ioperf: registering bdev\n");
 
-    /* Register io_device with correct key that matches bdev subsystem expectations.
-     * The bdev code uses __bdev_to_io_dev(bdev) = (char *)bdev + 1 as the key.
-     * So we use (char *)&ioperf->bdev + 1 to match. */
-    spdk_io_device_register((char *)&ioperf->bdev + 1, ioperf_bdev_create_cb, ioperf_bdev_destroy_cb,
+    /* Register io_device with ioperf pointer */
+    spdk_io_device_register(ioperf, ioperf_bdev_create_cb, ioperf_bdev_destroy_cb,
                         sizeof(struct ioperf_io_channel), "ioperf");
 
     rc = spdk_bdev_register(&ioperf->bdev);
